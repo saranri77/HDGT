@@ -40,6 +40,20 @@ import dgl
 # =============================================================================
 SCALE_FACTOR = 50.0
 
+# =============================================================================
+# AGENT AVERAGE SPEEDS (in meters/second)
+# Used for speed-normalized metric comparison across agent types
+# These are estimated typical speeds for fair performance comparison
+# =============================================================================
+AGENT_SPEEDS = {
+    1: 1.5,   # Pedestrian: ~1.5 m/s (3 mph)
+    2: 5.0,   # Biker: ~5.0 m/s (11 mph)
+    3: 8.0,   # Car: ~8.0 m/s (18 mph)
+    4: 7.0,   # Bus: ~7.0 m/s (16 mph)
+    5: 3.0,   # Cart: ~3.0 m/s (7 mph)
+    6: 6.0    # Skater: ~6.0 m/s (13 mph)
+}
+
 # Agent type name mapping
 AGENT_TYPE_NAMES = {
     1: "Pedestrian",
@@ -91,7 +105,7 @@ def split_train_val(train_files):
 
 def resolve_split_files(data_folder, split):
     """Pickle paths for 'train', 'val' or 'test'. One source of truth so the
-    train, test and visualization scripts cannot drift apart."""
+    train and test scripts cannot drift apart."""
     if split not in ("train", "val", "test"):
         raise ValueError(f"split must be train/val/test, got {split!r}")
     if split == "test":
@@ -297,19 +311,20 @@ class SDDDataset(Dataset):
         total_agents = sum(self.agent_counts.values())
         
         print(f"\nAgent Type Distribution:")
-        print(f"{'-'*60}")
-        print(f"{'Agent Type':<15} {'Count':>10} {'Percentage':>12}")
-        print(f"{'-'*60}")
-
+        print(f"{'-'*80}")
+        print(f"{'Agent Type':<15} {'Count':>10} {'Percentage':>12} {'Avg Speed (m/s)':>18}")
+        print(f"{'-'*80}")
+        
         for agent_type in sorted(self.agent_counts.keys()):
             count = self.agent_counts[agent_type]
             percentage = (count / total_agents * 100) if total_agents > 0 else 0
             name = AGENT_TYPE_NAMES[agent_type]
-            print(f"{name:<15} {count:>10,} {percentage:>11.2f}%")
-
-        print(f"{'-'*60}")
+            speed = AGENT_SPEEDS[agent_type]
+            print(f"{name:<15} {count:>10,} {percentage:>11.2f}% {speed:>18.1f}")
+        
+        print(f"{'-'*80}")
         print(f"{'TOTAL':<15} {total_agents:>10,} {100.0:>11.2f}%")
-        print(f"{'-'*60}")
+        print(f"{'-'*80}")
 
     def _tracks_of_scene(self, df):
         """Per agent (trackId): its frames, positions and box sizes sorted by frame (SCALED), and its type"""
@@ -364,7 +379,6 @@ class SDDDataset(Dataset):
         target_types = []
         target_labels_pos = []  # Position labels for evaluation
         target_labels_vel = []  # Velocity labels for diffusion training
-        target_goals = []  # Goal positions (final timestep) for goal-conditioned prediction
         target_track_ids = []
         context_agents = []
         context_types = []
@@ -417,15 +431,10 @@ class SDDDataset(Dataset):
                     np.vstack([positions[self.obs_len-1:self.obs_len], pred_positions])
                 )[1:]  # (12, 2) - skip the replicated first velocity
 
-                # GOAL POSITION: Final position (timestep 19) relative to last observation
-                # This is already in ego-centric coordinates (relative to pos[7])
-                goal_position = pred_positions[-1, :]  # (2,) - Last timestep position
-
                 target_agents.append(features)
                 target_types.append(agent_type)
                 target_labels_pos.append(pred_positions)
                 target_labels_vel.append(pred_velocities)
-                target_goals.append(goal_position)
                 target_track_ids.append(track_id)
 
             else:
@@ -471,7 +480,6 @@ class SDDDataset(Dataset):
         # Stack labels (all SCALED)
         labels_pos = np.stack(target_labels_pos, axis=0)  # (pred_num, 12, 2) SCALED positions
         labels_vel = np.stack(target_labels_vel, axis=0)  # (pred_num, 12, 2) SCALED per-frame velocities
-        goal_pos = np.stack(target_goals, axis=0)  # (pred_num, 2) SCALED goal positions
         label_masks = np.ones((pred_num, self.pred_len))
 
         sample = {
@@ -480,7 +488,6 @@ class SDDDataset(Dataset):
             'pred_num': pred_num,
             'label_pos': labels_pos,      # Position labels for evaluation (SCALED)
             'label_vel': labels_vel,      # Velocity labels for diffusion (SCALED, per-frame)
-            'goal_pos': goal_pos,         # Goal positions (final timestep) for goal-conditioned prediction (SCALED)
             'label_mask': label_masks,
             'scene_id': scene_id,
             'object_id_lis': target_track_ids,
@@ -774,7 +781,6 @@ def SDD_collate_fn(batch, args, is_train):
     pred_num_lis = np.array([item["pred_num"] for item in batch])
     label_pos_lis = [item["label_pos"] for item in batch]
     label_vel_lis = [item["label_vel"] for item in batch]
-    goal_pos_lis = [item["goal_pos"] for item in batch]  # Goal positions for goal-conditioned prediction
     label_mask_lis = [item["label_mask"] for item in batch]
     case_id_lis = [item["scene_id"] for item in batch]
     object_id_lis = [item["object_id_lis"] for item in batch]
@@ -794,7 +800,6 @@ def SDD_collate_fn(batch, args, is_train):
             pred_num_lis[i] = int(target_keep_index.sum())
             label_pos_lis[i] = label_pos_lis[i][target_keep_index]
             label_vel_lis[i] = label_vel_lis[i][target_keep_index]
-            goal_pos_lis[i] = goal_pos_lis[i][target_keep_index]
             label_mask_lis[i] = label_mask_lis[i][target_keep_index]
 
     neighbor_size = np.array([int(agent_feature_lis[i].shape[0]) for i in range(len(agent_feature_lis))])
@@ -803,7 +808,6 @@ def SDD_collate_fn(batch, args, is_train):
     out_graph_lis = []
     out_label_pos_lis = []
     out_label_vel_lis = []
-    out_goal_pos_lis = []
     out_label_mask_lis = []
 
     for i in range(len(agent_feature_lis)):
@@ -869,13 +873,9 @@ def SDD_collate_fn(batch, args, is_train):
         # Position labels (relative to last observation) - SCALED
         now_label_pos = label_pos_lis[i][selected_pred_indices].copy()
         now_label_pos = now_label_pos - ref_coor[:, np.newaxis, :]
-
+        
         # Velocity labels - SCALED, per-frame
         now_label_vel = label_vel_lis[i][selected_pred_indices].copy()
-
-        # Goal positions (final timestep) - SCALED
-        now_goal_pos = goal_pos_lis[i][selected_pred_indices].copy()
-        now_goal_pos = now_goal_pos - ref_coor  # Make relative to last observation
 
         ref_psi = now_full_agent_n_feature[:, -1, 4:5].copy()
         normal_val = np.concatenate([ref_coor, ref_psi], axis=-1)
@@ -883,17 +883,12 @@ def SDD_collate_fn(batch, args, is_train):
 
         sin_theta = np.sin(-ref_psi)
         cos_theta = np.cos(-ref_psi)
-
+        
         # Rotate position labels
         rotate(now_label_pos, cos_theta, sin_theta)
-
+        
         # Rotate velocity labels
         rotate(now_label_vel, cos_theta, sin_theta)
-
-        # Rotate goal positions (add dimension for rotation, then remove)
-        now_goal_pos = now_goal_pos[:, np.newaxis, :]  # (N, 2) -> (N, 1, 2)
-        rotate(now_goal_pos, cos_theta, sin_theta)
-        now_goal_pos = now_goal_pos[:, 0, :]  # (N, 1, 2) -> (N, 2)
 
         # Normalize agent features
         now_full_agent_n_feature = normal_agent_feature(
@@ -920,24 +915,20 @@ def SDD_collate_fn(batch, args, is_train):
         out_graph_lis.append(g)
         out_label_pos_lis.append(now_label_pos)
         out_label_vel_lis.append(now_label_vel)
-        out_goal_pos_lis.append(now_goal_pos)
         out_label_mask_lis.append(label_mask_lis[i][selected_pred_indices])
 
     # Batch everything
     output_dic = {}
     output_dic["cuda_tensor_lis"] = [
-        "graph_lis", "label_lis", "label_pos_lis", "goal_pos_lis", "label_mask_lis"
+        "graph_lis", "label_lis", "label_pos_lis", "label_mask_lis"
     ]
-
+    
     # Velocity labels for diffusion training (SCALED, per-frame)
     output_dic["label_lis"] = torch.as_tensor(np.concatenate(out_label_vel_lis, axis=0).astype(np.float32))
-
+    
     # Position labels for evaluation metrics (SCALED - will be de-scaled in train.py)
     output_dic["label_pos_lis"] = torch.as_tensor(np.concatenate(out_label_pos_lis, axis=0).astype(np.float32))
-
-    # Goal positions for goal-conditioned prediction (SCALED, in ego-centric coordinates)
-    output_dic["goal_pos_lis"] = torch.as_tensor(np.concatenate(out_goal_pos_lis, axis=0).astype(np.float32))
-
+    
     output_dic["label_mask_lis"] = torch.as_tensor(np.concatenate(out_label_mask_lis, axis=0).astype(np.float32))
 
     # Batch graphs
