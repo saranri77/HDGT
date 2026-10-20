@@ -121,7 +121,6 @@ parser.add_argument('--num_of_gnn_layer', type=int, default=6, help='HDGT encode
 parser.add_argument('--hidden_dim', type=int, default=256, help='hidden dimension')
 parser.add_argument('--head_dim', type=int, default=32, help='attention head dimension')
 parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
-parser.add_argument('--zero_init_decoder_output', type=str, default="False", help='start the diffusion decoder\'s output layer at zero, so the denoiser first predicts zero noise (True), or keep the random start weights_init gives every Linear layer (False)')
 parser.add_argument('--num_worker', type=int, default=8, help='dataloader workers')
 
 #### Dataset Settings
@@ -358,11 +357,10 @@ def main_worker(gpu, gpu_count, global_seed, args):
 
     model = model_module.HDGT_model(input_dim=8, args=args)
     model.apply(model_module.weights_init)
-    if args.zero_init_decoder_output == "True":
-        # weights_init re-randomizes every Linear, including the diffusion
-        # decoder's output layer, which the model itself starts at zero
-        nn.init.zeros_(model.diffusion_decoder.output_proj.weight)
-        nn.init.zeros_(model.diffusion_decoder.output_proj.bias)
+    # weights_init re-randomizes every Linear, including the diffusion decoder's output layer,
+    # which the model itself starts at zero (the denoiser first predicts zero noise): put it back
+    nn.init.zeros_(model.diffusion_decoder.output_proj.weight)
+    nn.init.zeros_(model.diffusion_decoder.output_proj.bias)
 
     print("Loading Dataset...")
     train_dataloader, val_dataloader, train_sample_num, val_sample_num = obtain_dataset(global_rank, gpu_count, global_seed, args)
