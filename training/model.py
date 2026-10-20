@@ -43,7 +43,9 @@ class SEBasicBlock(nn.Module):
         self.downsample = None
         self.se = SEBlock(in_c)
         if stride != 1:
-            if temporal_length == 6 or temporal_length == 2:
+            # Pool the shortcut the way the stride-2 conv shortens the sequence: an even length
+            # halves exactly (no padding), an odd one is rounded up (padding)
+            if temporal_length % 2 == 0:
                 self.downsample = nn.Sequential(torch.nn.AvgPool1d(kernel_size=2, stride=2), nn.Conv1d(kernel_size=1, in_channels=in_c, out_channels=out_c, stride=1), nn.BatchNorm1d(out_c))
             else:
                 self.downsample = nn.Sequential(torch.nn.AvgPool1d(kernel_size=2, stride=2, padding=1, count_include_pad=False), nn.Conv1d(kernel_size=1, in_channels=in_c, out_channels=out_c, stride=1), nn.BatchNorm1d(out_c))
@@ -77,7 +79,11 @@ class TemporalBlock(nn.Module):
 class AgentTemporalEncoder(nn.Module):
     def __init__(self, args):
         super().__init__()
-        kernel_size_dic = {0:11, 1:6, 2:3, 3:2, 4:1, 5:1, 6:1, 7:1, 8:1, 9:1, 10:1}
+        # Sequence length entering each temporal block: the first gets the whole observation, the
+        # second what is left after the first block's stride-2 conv, rounded up
+        # (original HDGT: {0: 11, 1: 6} for its 11 observed steps)
+        obs_len = args.obs_len
+        kernel_size_dic = {0: obs_len, 1: (obs_len + 1) // 2}
         self.temporal_layers = torch.nn.ModuleList([TemporalBlock(args.hidden_dim, kernel_size_dic[_], args) for _ in range(2)])
     def forward(self, feat):
         feat = self.temporal_layers[0](feat)
@@ -144,14 +150,17 @@ class Agent2embedding(nn.Module):
         super().__init__()
         self.hidden_dim = args.hidden_dim
         self.act = nn.ReLU(inplace=True)
-        ## -4 - minus coor and mask, args.hidden_dim//4 - coordinate feature
-        self.fea_MLP = MLP(input_dim-4+args.hidden_dim//4, args.hidden_dim//2, args.hidden_dim, norm=BN1D)
+        # SDD: input_dim=8 [x, y, vx, vy, cos_yaw, sin_yaw, width, length]
+        # Take out xy (2 features), add encoded coordinates (hidden_dim//4)
+        # Remaining: vx, vy, cos_yaw, sin_yaw, width, length (6) + encoded xy (hidden_dim//4)
+        self.fea_MLP = MLP(input_dim-2+args.hidden_dim//4, args.hidden_dim//2, args.hidden_dim, norm=BN1D)
     def forward(self, input_dic, shared_coor_encoder):
-        #0-2 x, y, z, 3-4 vx, vy, 5-6 cos, sin, 7-9 witdth, length, height 10 mask
-        x = input_dic["graph_lis"].ndata["a_n_fea"]["agent"]
-        #z, vx, vy, cos, sin, width, length, height, mask
-        coor_fea = shared_coor_encoder(x[..., :3])
-        fea = torch.cat([coor_fea, x[..., 3:-1]], dim=-1)
+        # SDD features: [x, y, vx, vy, cos_yaw, sin_yaw, width, length] (8 total)
+        x = input_dic["graph_lis"].nodes["agent"].data["a_n_fea"]
+        # Encode x,y coordinates (first 2 features)
+        coor_fea = shared_coor_encoder(x[..., :2])
+        # Concatenate encoded coordinates with velocity, yaw, and size (features 2-7)
+        fea = torch.cat([coor_fea, x[..., 2:]], dim=-1)
         fea = self.fea_MLP(fea)
         return fea.transpose(1, 2)
 
@@ -178,11 +187,11 @@ class Lane2embedding(nn.Module):
         self.lane_e_out_fc = MLP(d_in=args.hidden_dim+args.hidden_dim//4+args.hidden_dim//4, d_hid=args.hidden_dim*4, d_out=args.hidden_dim, norm=BN1D)
 
     def forward(self, input_dic, shared_coor_encoder, shared_rel_encoder):
-        coor_fea = input_dic["graph_lis"].ndata["l_n_coor_fea"]["lane"]
+        coor_fea = input_dic["graph_lis"].nodes["lane"].data["l_n_coor_fea"]
         coor_fea =  shared_coor_encoder(coor_fea)
         coor_fea = self.pointnet(coor_fea)
         coor_fea = self.act(self.point_out_fc(coor_fea.max(dim=1)[0]))
-        type_fea = self.type_emb(input_dic["graph_lis"].ndata["l_n_type_fea"]["lane"])
+        type_fea = self.type_emb(input_dic["graph_lis"].nodes["lane"].data["l_n_type_fea"])
 
         lane_n_num = coor_fea.shape[0]
         ## If there is no stop sign/traffic signal controlling the lane, the cooresponding features are all zeros 
@@ -293,7 +302,7 @@ class LaneHetGNN(nn.Module):
             for _ in ["left", "right", "prev", "follow"]})
         
         self.node_mlp["a2l"] = nn.ModuleList([MLP(args.hidden_dim, args.hidden_dim, args.hidden_dim, norm=nn.LayerNorm, prenorm=True)
-        for _ in range(3)])
+        for _ in range(6)])
 
         self.node_fc = nn.Linear(self.etype_num*args.hidden_dim, args.hidden_dim)
         self.node_ffn = PositionwiseFeedForward(args.hidden_dim, args.hidden_dim*4, args.dropout, args)
@@ -305,7 +314,7 @@ class LaneHetGNN(nn.Module):
         self.edge_MLP = MLP(args.hidden_dim*3, args.hidden_dim*4, args.hidden_dim, norm=nn.LayerNorm, dropout=args.dropout, prenorm=True)
         
         self.agent_edge_MLP = nn.ModuleList([MLP(args.hidden_dim*3, args.hidden_dim*4, args.hidden_dim, norm=nn.LayerNorm, dropout=args.dropout, prenorm=True)
-        for _ in range(3)
+        for _ in range(6)
         ])
 
     def forward(self, input_dic):
@@ -315,16 +324,16 @@ class LaneHetGNN(nn.Module):
             self.a_e_type_dict = input_dic["a_e_type_dict"]
             
             input_dic["graph_lis"].multi_update_all(etype_dict=self.etype_dic, cross_reducer="stack") ## Stack all features of all types of in-edges
-            output_lane_n_fea = input_dic["graph_lis"].ndata["l_n_hidden_out"]["lane"]
-            
-            output_lane_n_fea = self.node_fc(output_lane_n_fea.view(output_lane_n_fea.shape[0], -1)) + input_dic["graph_lis"].ndata["l_n_hidden"]["lane"]
+            output_lane_n_fea = input_dic["graph_lis"].nodes["lane"].data["l_n_hidden_out"]
+
+            output_lane_n_fea = self.node_fc(output_lane_n_fea.view(output_lane_n_fea.shape[0], -1)) + input_dic["graph_lis"].nodes["lane"].data["l_n_hidden"]
             output_lane_n_fea = self.node_ffn(output_lane_n_fea)
             
-            output_e_fea = [self.edge_MLP(torch.cat([input_dic["graph_lis"].ndata["l_n_hidden"]["lane"][input_dic["graph_lis"].edges(etype=_)[0]], input_dic["graph_lis"].edges[_].data["l_e_hidden"], input_dic["graph_lis"].ndata["l_n_hidden"]["lane"][input_dic["graph_lis"].edges(etype=_)[1]]], dim=-1))+input_dic["graph_lis"].edges[_].data["l_e_hidden"] for _ in ["left", "right", "prev", "follow"]]
+            output_e_fea = [self.edge_MLP(torch.cat([input_dic["graph_lis"].nodes["lane"].data["l_n_hidden"][input_dic["graph_lis"].edges(etype=_)[0]], input_dic["graph_lis"].edges[_].data["l_e_hidden"], input_dic["graph_lis"].nodes["lane"].data["l_n_hidden"][input_dic["graph_lis"].edges(etype=_)[1]]], dim=-1))+input_dic["graph_lis"].edges[_].data["l_e_hidden"] for _ in ["left", "right", "prev", "follow"]]
 
-            agent2lane_e_fea = torch.cat([input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][input_dic["graph_lis"].edges(etype="a2l")[0]], input_dic["graph_lis"].edges["a2l"].data["a_e_hidden"], input_dic["graph_lis"].ndata["l_n_hidden"]["lane"][input_dic["graph_lis"].edges(etype="a2l")[1]]], dim=-1)
+            agent2lane_e_fea = torch.cat([input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"][input_dic["graph_lis"].edges(etype="a2l")[0]], input_dic["graph_lis"].edges["a2l"].data["a_e_hidden"], input_dic["graph_lis"].nodes["lane"].data["l_n_hidden"][input_dic["graph_lis"].edges(etype="a2l")[1]]], dim=-1)
             output_agent2lane_e_fea = torch.zeros_like(input_dic["graph_lis"].edges["a2l"].data["a_e_hidden"])
-            for agent_type_index in range(3):
+            for agent_type_index in range(6):
                 if len(self.a_e_type_dict["a2l"][agent_type_index]) != 0:
                     output_agent2lane_e_fea[self.a_e_type_dict["a2l"][agent_type_index]] = self.agent_edge_MLP[agent_type_index](agent2lane_e_fea[self.a_e_type_dict["a2l"][agent_type_index]]) +input_dic["graph_lis"].edges["a2l"].data["a_e_hidden"][self.a_e_type_dict["a2l"][agent_type_index]]
             output_e_fea.append(output_agent2lane_e_fea)
@@ -336,7 +345,7 @@ class LaneHetGNN(nn.Module):
         else:
             tmp_out = torch.zeros_like((edges.data["a_e_hidden"]))
             tmp_input = edges.data["a_e_hidden"]
-            for agent_type_index in range(3):
+            for agent_type_index in range(6):
                 if len(self.a_e_type_dict[etype][agent_type_index]) != 0:
                     tmp_out[self.a_e_type_dict[etype][agent_type_index]] = self.node_mlp[etype][agent_type_index](tmp_input[self.a_e_type_dict[etype][agent_type_index]])
             return {"l_e_hidden_"+etype:tmp_out}
@@ -359,37 +368,32 @@ class AgentHetGNN(nn.Module):
         d_v = self.head_dim
         self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5), args=args)
 
+        # SDD: Only "other" query needed (not 3 for other/lane/polygon)
         self.wqs = nn.ModuleList([nn.Sequential(
             self.norm(self.d_model),
-            nn.Linear(self.d_model, self.n_head * d_k * 3, bias=False),
+            nn.Linear(self.d_model, self.n_head * d_k, bias=False),
         )
-        for _ in range(3)
+        for _ in range(6)
         ])
 
-        self.wkvs = nn.ModuleDict({
-            _: nn.Sequential(
-                self.norm(self.d_model),
-                nn.Linear(self.d_model, self.n_head * d_k * 2, bias=False)
-                ) 
-            for _ in ["l2a", "g2a"]
-        })
-        
+        # SDD: Only agent-to-agent edges (no lane or polygon)
+        self.wkvs = nn.ModuleDict({})
         self.wkvs["other"] = nn.ModuleList([
             nn.Sequential(
                 self.norm(self.d_model),
                 nn.Linear(self.d_model, self.n_head * d_k * 2, bias=False)
-                ) 
-        for _ in range(3)
+                )
+        for _ in range(6)
         ])
-        
+
+        # SDD: Only "other" attention (agent-to-agent)
         self.attn_fcs = nn.ModuleList([nn.ModuleDict({
-            _:nn.Sequential(
+            "other": nn.Sequential(
                 nn.Linear(self.n_head * d_v, self.d_model, bias=True),
                 nn.ReLU(inplace=True)
             )
-            for _ in ["l2a", "g2a", "other"]
         })
-        for agent_type_index in range(3)]
+        for agent_type_index in range(6)]
         )
         
         
@@ -398,69 +402,75 @@ class AgentHetGNN(nn.Module):
                 nn.Linear(self.hidden_dim, self.hidden_dim, bias=True),
                 nn.ReLU(inplace=True)
             )
-        for _ in range(3)]
+        for _ in range(6)]
         )
         
+        # SDD: Only 2 edge types (self, other) - no lane or polygon
         self.out_fc =  nn.ModuleList([nn.Sequential(
-            nn.Linear(self.hidden_dim*4, self.hidden_dim, bias=True),
+            nn.Linear(self.hidden_dim*2, self.hidden_dim, bias=True),
             nn.Dropout(args.dropout) if args.dropout > 0.0 else nn.Identity()
         )
-        for _ in range(3)])
+        for _ in range(6)])
                 
         self.out_ffn = nn.ModuleList([PositionwiseFeedForward(args.hidden_dim, args.hidden_dim*4, args.dropout, nn.LayerNorm)
-        for _ in range(3)
+        for _ in range(6)
         ])
-        self.etype_dic = {}
-        for etype in ["other", "l2a", "g2a"]:
-            self.etype_dic[etype] = (partial(self.message_func, etype=etype), partial(self.reduce_func, etype=etype))
-        self.etype2hidden_name = {"other":"a_e_hidden", "l2a":"l_e_hidden", "g2a":"g_e_hidden"}
-        self.etype2src_name = {"other":"agent", "l2a":"lane", "g2a":"polygon"}
-
-        self.edge_MLP = {
-            "l2a":MLP(args.hidden_dim*3, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True),
-            "g2a":MLP(args.hidden_dim*2, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True),
+        # SDD: Only "other" edge type for agent-to-agent message passing
+        self.etype_dic = {
+            "other": (partial(self.message_func, etype="other"), partial(self.reduce_func, etype="other"))
         }
-        self.edge_MLP["self"] =  nn.ModuleList([MLP(args.hidden_dim, args.hidden_dim, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True)
-        for _ in range(3)
+        self.etype2hidden_name = {"other": "a_e_hidden"}
+        self.etype2src_name = {"other": "agent"}
+
+        # SDD: Only self and other edge MLPs (no lane or polygon)
+        self.edge_MLP = {}
+        self.edge_MLP["self"] = nn.ModuleList([MLP(args.hidden_dim, args.hidden_dim, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True)
+        for _ in range(6)
         ])
-        
+
         self.edge_MLP["other"] = nn.ModuleList([MLP(args.hidden_dim*3, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True)
-        for _ in range(3)
-        ])        
+        for _ in range(6)
+        ])
         self.edge_MLP = nn.ModuleDict(self.edge_MLP)
 
     def forward(self, input_dic):
         self.a_e_type_dict = input_dic["a_e_type_dict"]
-        self.a_n_type_lis = input_dic["a_n_type_lis"] 
-        with input_dic["graph_lis"].local_scope():            
+        self.a_n_type_lis = input_dic["a_n_type_lis"]
+        with input_dic["graph_lis"].local_scope():
             self.device = "cuda:"+str(input_dic["gpu"])
-            
-            input_q = input_dic["graph_lis"].ndata["a_n_hidden"]["agent"]
-            q = torch.zeros((input_dic["graph_lis"].ndata["a_n_hidden"]["agent"].shape[0], self.n_head * self.head_dim * 3), device=self.device)
-            for agent_type_index in  range(3):
+
+            input_q = input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"]
+            # SDD: Only generate query for "other" agent-to-agent edges
+            q = torch.zeros((input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"].shape[0], self.n_head * self.head_dim), device=self.device)
+            for agent_type_index in  range(6):
                 if len(self.a_n_type_lis[agent_type_index]) != 0:
                     q[self.a_n_type_lis[agent_type_index]] = self.wqs[agent_type_index](input_q[self.a_n_type_lis[agent_type_index]])
-            other_q, lane_q, polygon_q = q.view(input_q.shape[0], self.n_head, self.head_dim*3).split(dim=-1, split_size=self.head_dim)         
 
+            other_q = q.view(input_q.shape[0], self.n_head, self.head_dim)
             input_dic["graph_lis"].nodes["agent"].data["other_q"] = other_q
-            input_dic["graph_lis"].nodes["agent"].data["l2a_q"] = lane_q
-            input_dic["graph_lis"].nodes["agent"].data["g2a_q"] = polygon_q
-            input_dic["graph_lis"].multi_update_all(etype_dict=self.etype_dic, cross_reducer="stack")
-            all_out_fea = input_dic["graph_lis"].ndata["a_n_hidden_out"]["agent"]
 
-            other_out_tmp_in = all_out_fea[:, 0, :]
-            lane_out_fea_tmp_in = all_out_fea[:, 1, :]
-            polygon_out_fea_tmp_in = all_out_fea[:, 2, :]
+            # Initialize output for all nodes (needed for nodes without incoming edges)
+            num_nodes = input_dic["graph_lis"].number_of_nodes("agent")
+            input_dic["graph_lis"].nodes["agent"].data["a_n_hidden_out"] = torch.zeros(
+                (num_nodes, self.n_head * self.head_dim), device=self.device
+            )
+
+            # SDD: Only process "other" edges (agent-to-agent)
+            input_dic["graph_lis"].multi_update_all(etype_dict=self.etype_dic, cross_reducer="stack")
+            all_out_fea = input_dic["graph_lis"].nodes["agent"].data["a_n_hidden_out"]
+
+            # SDD: Only unpack "other" features (squeeze stacking dimension if present)
+            other_out_tmp_in = all_out_fea.squeeze(1) if len(all_out_fea.shape) == 3 else all_out_fea
             input_self_fea = input_dic["graph_lis"].edges["self"].data["a_e_hidden"]
             all_out_n_fea = torch.zeros_like(input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"])
-            for agent_type_index in range(3):
+            for agent_type_index in range(6):
                 if len(self.a_n_type_lis[agent_type_index]) != 0:
+                    # SDD: Only process "other" agent-to-agent features (no lane or polygon)
                     other_out_fea = self.attn_fcs[agent_type_index]["other"](other_out_tmp_in[self.a_n_type_lis[agent_type_index]])
-                    lane_out_fea = self.attn_fcs[agent_type_index]["l2a"](lane_out_fea_tmp_in[self.a_n_type_lis[agent_type_index]])
-                    polygon_out_fea = self.attn_fcs[agent_type_index]["g2a"](polygon_out_fea_tmp_in[self.a_n_type_lis[agent_type_index]])
                     self_fea = self.self_fc[agent_type_index](input_self_fea[self.a_n_type_lis[agent_type_index]])
-                    
-                    out_n_fea = torch.stack([self_fea, other_out_fea, lane_out_fea, polygon_out_fea], dim=1)
+
+                    # SDD: Stack only self and other features
+                    out_n_fea = torch.stack([self_fea, other_out_fea], dim=1)
                     out_n_fea = self.out_fc[agent_type_index](out_n_fea.view(out_n_fea.shape[0], -1)) + input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"][self.a_n_type_lis[agent_type_index]]
                     out_n_fea = self.out_ffn[agent_type_index](out_n_fea)
 
@@ -468,40 +478,36 @@ class AgentHetGNN(nn.Module):
 
             out_e_fea_lis = []
             self_e_fea_tmp_in = input_dic["graph_lis"].edges["self"].data["a_e_hidden"]
-            other_e_fea_tmp_in = torch.cat([input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][input_dic["graph_lis"].edges(etype="other")[0]], input_dic["graph_lis"].edges["other"].data["a_e_hidden"], input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][input_dic["graph_lis"].edges(etype="other")[1]]], dim=-1)
+            other_e_fea_tmp_in = torch.cat([input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"][input_dic["graph_lis"].edges(etype="other")[0]], input_dic["graph_lis"].edges["other"].data["a_e_hidden"], input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"][input_dic["graph_lis"].edges(etype="other")[1]]], dim=-1)
             
             self_e_fea_tmp_out = torch.zeros_like(self_e_fea_tmp_in)
             other_e_fea_tmp_out = torch.zeros((other_e_fea_tmp_in.shape[0], self.hidden_dim), device=self.device)
-            for agent_type_index in range(3):
+            for agent_type_index in range(6):
                 if len(self.a_e_type_dict["self"][agent_type_index]) != 0:
                     self_e_fea_tmp_out[self.a_e_type_dict["self"][agent_type_index]] = self.edge_MLP["self"][agent_type_index](self_e_fea_tmp_in[self.a_e_type_dict["self"][agent_type_index]])
                 if len(self.a_e_type_dict["other"][agent_type_index]) != 0:
                     other_e_fea_tmp_out[self.a_e_type_dict["other"][agent_type_index]] =  self.edge_MLP["other"][agent_type_index](other_e_fea_tmp_in[self.a_e_type_dict["other"][agent_type_index]])
             out_e_fea_lis.append(self_e_fea_tmp_out + input_dic["graph_lis"].edges["self"].data["a_e_hidden"])
             out_e_fea_lis.append(other_e_fea_tmp_out + input_dic["graph_lis"].edges["other"].data["a_e_hidden"])
-            
-            l2a_out_e_fea = torch.cat([input_dic["graph_lis"].ndata["l_n_hidden"]["lane"][input_dic["graph_lis"].edges(etype="l2a")[0]], input_dic["graph_lis"].edges["l2a"].data["l_e_hidden"], input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][input_dic["graph_lis"].edges(etype="l2a")[1]]], dim=-1)
-            l2a_out_e_fea = self.edge_MLP["l2a"](l2a_out_e_fea)
-            out_e_fea_lis.append(l2a_out_e_fea + input_dic["graph_lis"].edges["l2a"].data["l_e_hidden"])
-            
-            g2a_out_e_fea = torch.cat([input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][input_dic["graph_lis"].edges(etype="g2a")[1]], input_dic["graph_lis"].edges["g2a"].data["g_e_hidden"]], dim=-1)
-            g2a_out_e_fea = self.edge_MLP["g2a"](g2a_out_e_fea)
-            out_e_fea_lis.append(g2a_out_e_fea + input_dic["graph_lis"].edges["g2a"].data["g_e_hidden"])
+            # SDD: No lane or polygon edges to process
         return all_out_n_fea, out_e_fea_lis
 
     def message_func(self, edges, etype):
-        if etype != "other":
-            k, v = self.wkvs[etype](edges.data[self.etype2hidden_name[etype]]).view(-1, self.n_head, self.head_dim*2).split(dim=-1, split_size=self.head_dim)
-        else:
-            tmp_input = edges.data[self.etype2hidden_name[etype]]
-            tmp_output = torch.zeros((tmp_input.shape[0], self.n_head * self.head_dim * 2), device=self.device)
-            for agent_type_index in range(3):
-                if len(self.a_e_type_dict["other"][agent_type_index]) != 0:
-                    tmp_output[self.a_e_type_dict["other"][agent_type_index]] = self.wkvs[etype][agent_type_index](tmp_input[self.a_e_type_dict["other"][agent_type_index]])
-            k, v = tmp_output.view(-1, self.n_head, self.head_dim*2).split(dim=-1, split_size=self.head_dim)
+        # SDD: Only handle "other" edge type (agent-to-agent)
+        tmp_input = edges.data[self.etype2hidden_name[etype]]
+        tmp_output = torch.zeros((tmp_input.shape[0], self.n_head * self.head_dim * 2), device=self.device)
+        for agent_type_index in range(6):
+            if len(self.a_e_type_dict["other"][agent_type_index]) != 0:
+                tmp_output[self.a_e_type_dict["other"][agent_type_index]] = self.wkvs[etype][agent_type_index](tmp_input[self.a_e_type_dict["other"][agent_type_index]])
+        k, v = tmp_output.view(-1, self.n_head, self.head_dim*2).split(dim=-1, split_size=self.head_dim)
         return {etype+"_k":k, etype+"_v":v}
 
     def reduce_func(self, nodes, etype):
+        # Handle case where node has no incoming edges
+        if nodes.mailbox[etype+"_k"].shape[1] == 0:
+            node_num = nodes.mailbox[etype+"_k"].shape[0]
+            return {"a_n_hidden_out": torch.zeros((node_num, self.n_head * self.head_dim), device=self.device)}
+
         node_num, neighbor_num, n_head, hidden = nodes.mailbox[etype+"_k"].shape
         q = nodes.data[etype+"_q"].view(node_num*self.n_head, -1).unsqueeze(1)
         k = nodes.mailbox[etype+"_k"].transpose(1, 2).reshape(node_num*self.n_head, neighbor_num, -1)
@@ -515,59 +521,58 @@ class HDGT_encoder(nn.Module):
     def __init__(self, input_dim, args):
         super().__init__()
         self.hidden_dim = args.hidden_dim
-        self.shared_coor_encoder = MLP(d_in=3, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None) ## Encode x,y,z
-        self.shared_rel_encoder = MLP(d_in=5, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None) ## Encode Delta (x, y, z, cos(psi), sin(psi))
+        self.shared_coor_encoder = MLP(d_in=2, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None) ## Encode x,y (2D for SDD)
+        self.shared_rel_encoder = MLP(d_in=4, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None) ## Encode Delta (x, y, sin(psi), cos(psi)) - 4D for SDD
         
         self.agent_emb = Agent2embedding(input_dim, args)
-        self.temporal_encoders = torch.nn.ModuleList([AgentTemporalEncoder(args) for _ in range(3)]) ## different temporal encoder for different agent type
+        self.temporal_encoders = torch.nn.ModuleList([AgentTemporalEncoder(args) for _ in range(6)]) ## different temporal encoder for different agent type
         ## Input: [Node Feature, Rel_Pos]
-        self.agent_e_fea_MLPs = torch.nn.ModuleList([MLP(args.hidden_dim+args.hidden_dim//4, args.hidden_dim*4, args.hidden_dim, norm=BN1D) for _ in range(3)]) ## Inti Agent Edge Feature
-        
-        self.lane_emb = Lane2embedding(args)
-        self.polygon_emb = Polygon2embedding(args)
-        
+        self.agent_e_fea_MLPs = torch.nn.ModuleList([MLP(args.hidden_dim+args.hidden_dim//4, args.hidden_dim*4, args.hidden_dim, norm=BN1D) for _ in range(6)]) ## Inti Agent Edge Feature
+
+        # SDD: No lane or polygon embeddings needed
         self.num_of_gnn_layer = args.num_of_gnn_layer
-        self.lane_gnns = torch.nn.ModuleList([LaneHetGNN(args=args) for _ in range(self.num_of_gnn_layer)])
         self.agent_gnns = torch.nn.ModuleList([AgentHetGNN(args=args) for _ in range(self.num_of_gnn_layer)])
 
 
     def forward(self, input_dic):
         ## Init Agent Node
         agent_n_emb = self.agent_emb(input_dic, self.shared_coor_encoder)
-        agent_n_type_indices = [torch.where((input_dic["graph_lis"].ndata["a_n_type"]["agent"]) == _) for _ in range(3)]
+        agent_n_type_indices = [torch.where((input_dic["graph_lis"].nodes["agent"].data["a_n_type"]) == _) for _ in range(6)]
         agent_n_fea = torch.zeros((agent_n_emb.shape[0], agent_n_emb.shape[1]), device="cuda:"+str(input_dic["gpu"]))
-        for _ in range(3):
+        for _ in range(6):
             agent_n_fea[agent_n_type_indices[_]] = self.temporal_encoders[_](agent_n_emb[agent_n_type_indices[_]])
 
         ## Init Agent-Related Edge
-        agent_e_type_lis = torch.cat([input_dic["graph_lis"].edata["a_e_type"][_] for _ in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]], dim=0)
-        agent_e_fea_rel_pos = torch.cat([input_dic["graph_lis"].edata["a_e_fea"][_] for _ in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]], dim=0)
-        agent_e_type_indices = [torch.where(agent_e_type_lis == _) for _ in range(3)]
-        agent_e_src_n_fea = torch.cat([agent_n_fea[input_dic["graph_lis"].edges(etype=_)[0],...]  for _ in ["self", "other", "a2l"]], dim=0)
+        # SDD: Only self and other edges (no lane or polygon)
+        agent_edge_types = [('agent', 'self', 'agent'), ('agent', 'other', 'agent')]
+        agent_edge_names = ["self", "other"]
+
+        agent_e_type_lis = torch.cat([input_dic["graph_lis"].edata["a_e_type"][_] for _ in agent_edge_types], dim=0)
+        agent_e_fea_rel_pos = torch.cat([input_dic["graph_lis"].edata["a_e_fea"][_] for _ in agent_edge_types], dim=0)
+        agent_e_type_indices = [torch.where(agent_e_type_lis == _) for _ in range(6)]
+        agent_e_src_n_fea = torch.cat([agent_n_fea[input_dic["graph_lis"].edges(etype=_)[0],...]  for _ in agent_edge_names], dim=0)
         agent_e_fea_rel_pos = self.shared_rel_encoder(agent_e_fea_rel_pos)
         agent_e_fea = torch.zeros((agent_e_fea_rel_pos.shape[0], self.hidden_dim), device="cuda:"+str(input_dic["gpu"]))
-        for _ in range(3):
+        for _ in range(6):
             agent_e_fea[agent_e_type_indices[_]] = self.agent_e_fea_MLPs[_](torch.cat([agent_e_fea_rel_pos[agent_e_type_indices[_]], agent_e_src_n_fea[agent_e_type_indices[_]]], dim=-1))
-        input_dic["graph_lis"].ndata["a_n_hidden"] = {"agent":agent_n_fea}
-        agent_e_num_lis_by_etype = np.cumsum([0] + [len(input_dic["graph_lis"].edata["a_e_type"][_]) for _ in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]])
-        for _index, _ in enumerate([('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]):
-            input_dic["graph_lis"].edata["a_e_hidden"] = {_:agent_e_fea[agent_e_num_lis_by_etype[_index]:agent_e_num_lis_by_etype[_index+1]]}
+        input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"] = agent_n_fea
+        agent_e_num_lis_by_etype = np.cumsum([0] + [len(input_dic["graph_lis"].edges[_].data["a_e_type"]) for _ in agent_edge_types])
+        for _index, _ in enumerate(agent_edge_types):
+            input_dic["graph_lis"].edges[_].data["a_e_hidden"] = agent_e_fea[agent_e_num_lis_by_etype[_index]:agent_e_num_lis_by_etype[_index+1]]
 
-        self.lane_emb(input_dic, self.shared_coor_encoder, self.shared_rel_encoder)
-        self.polygon_emb(input_dic, self.shared_coor_encoder)
+        # SDD: No lane or polygon embedding needed
 
-        
+        # Process agent GNN layers
         for i in range(self.num_of_gnn_layer):
-            output_lane_n_fea, output_in_lane_e_fea = self.lane_gnns[i](input_dic)
             output_agent_n_fea, output_in_agent_e_fea = self.agent_gnns[i](input_dic)
-            input_dic["graph_lis"].nodes["lane"].data["l_n_hidden"] = output_lane_n_fea
-            for _index, _ in enumerate(["left", "right", "prev", "follow"]):
-                input_dic["graph_lis"].edges[_].data["l_e_hidden"] = output_in_lane_e_fea[_index]
-            input_dic["graph_lis"].edges["a2l"].data["a_e_hidden"] = output_in_lane_e_fea[-1]
-            
             input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"] = output_agent_n_fea
-            for _index, _ in enumerate([("self", "a_e_hidden"), ("other", "a_e_hideen"), ("l2a", "l_e_hidden"), ("g2a", "g_e_hidden")]):
-                input_dic["graph_lis"].edges[_[0]].data[_[1]] = output_in_agent_e_fea[_index]
+
+            # Only the self-loop edge features are updated, as in the original HDGT: it stores the
+            # agent-agent ("other") edge update under a misspelled key ("a_e_hideen") that nothing
+            # reads, so "other" edges keep their initial features in every layer. Kept on purpose
+            # to match the original; assign output_in_agent_e_fea[1] to the "other" edges'
+            # "a_e_hidden" to update them instead.
+            input_dic["graph_lis"].edges["self"].data["a_e_hidden"] = output_in_agent_e_fea[0]
         return input_dic["graph_lis"]
 
 
@@ -581,7 +586,7 @@ class HDGT_model(nn.Module):
         self.num_prediction = args.num_prediction
         
         self.encoder = HDGT_encoder(input_dim, args)
-        self.decoder = torch.nn.ModuleList([RefineDecoder(args) for _ in range(3)])
+        self.decoder = torch.nn.ModuleList([RefineDecoder(args) for _ in range(6)])
         
     def forward(self, input_dic):
         output_het_graph = self.encoder(input_dic)
@@ -593,37 +598,37 @@ class HDGT_model(nn.Module):
         pred_num_lis = input_dic["pred_num_lis"]
         agent_node_fea = output_het_graph.nodes["agent"].data["a_n_hidden"]
         all_agent_id = input_dic["graph_lis"].nodes("agent")
-        agent_n_type_lis = output_het_graph.ndata["a_n_type"]["agent"]
+        agent_n_type_lis = output_het_graph.nodes["agent"].data["a_n_type"]
         
-        ## Obtain the node feature of target agents 
+        ## Obtain the node feature of target agents
         targat_agent_indice_lis = []
-        target_agent_indice_bool_type_lis = [[] for _ in range(3)]
-        targat_agent_fea = [[] for _ in range(3)]
-        target_agent_id = [[] for _ in range(3)]
+        target_agent_indice_bool_type_lis = [[] for _ in range(6)]
+        targat_agent_fea = [[] for _ in range(6)]
+        target_agent_id = [[] for _ in range(6)]
         for i in range(1, len(cumsum_neighbor_size_lis)):
             now_agent_type_lis = agent_n_type_lis[cumsum_neighbor_size_lis[i-1]:cumsum_neighbor_size_lis[i]]
             now_agent_id = all_agent_id[cumsum_neighbor_size_lis[i-1]:cumsum_neighbor_size_lis[i-1]+pred_num_lis[i-1]]
             now_agent_node_fea = agent_node_fea[cumsum_neighbor_size_lis[i-1]:cumsum_neighbor_size_lis[i-1]+pred_num_lis[i-1]]
-            now_target_agent_indice_bool_type_lis = [now_agent_type_lis[:pred_num_lis[i-1]]==_ for _ in range(3)]
-            
+            now_target_agent_indice_bool_type_lis = [now_agent_type_lis[:pred_num_lis[i-1]]==_ for _ in range(6)]
+
             targat_agent_indice_lis += list(range(cumsum_neighbor_size_lis[i-1], cumsum_neighbor_size_lis[i-1]+pred_num_lis[i-1]))
-            for _ in range(3):
+            for _ in range(6):
                 target_agent_indice_bool_type_lis[_].append(now_target_agent_indice_bool_type_lis[_])
                 targat_agent_fea[_].append(now_agent_node_fea[now_target_agent_indice_bool_type_lis[_]])
                 target_agent_id[_].append(now_agent_id[now_target_agent_indice_bool_type_lis[_]])
 
-        target_agent_indice_bool_type_lis = [torch.cat(target_agent_indice_bool_type_lis[_], dim=0) for _ in range(3)]
-        targat_agent_fea = [torch.cat(targat_agent_fea[_], dim=0) for _ in range(3)]
-        target_agent_id = [torch.cat(target_agent_id[_], dim=0) for _ in range(3)]
+        target_agent_indice_bool_type_lis = [torch.cat(target_agent_indice_bool_type_lis[_], dim=0) for _ in range(6)]
+        targat_agent_fea = [torch.cat(targat_agent_fea[_], dim=0) for _ in range(6)]
+        target_agent_id = [torch.cat(target_agent_id[_], dim=0) for _ in range(6)]
 
         prediction = []
-        for _ in range(3):
+        for _ in range(6):
             if targat_agent_fea[_].shape[0] == 0:
                 prediction.append((torch.zeros((0, 1)), torch.zeros((0, 1))))
             else:
                 prediction.append(self.decoder[_](targat_agent_fea[_], target_agent_id[_], all_agent_raw_traj, input_dic))
-        agent_cls_res = [prediction[_][0] for _ in range(3)]
-        agent_reg_res = [prediction[_][1] for _ in range(3)]
+        agent_cls_res = [prediction[_][0] for _ in range(6)]
+        agent_reg_res = [prediction[_][1] for _ in range(6)]
         return agent_reg_res, agent_cls_res, target_agent_indice_bool_type_lis
 
 
@@ -666,25 +671,27 @@ class RefineContextLayer(nn.Module):
         )
         
         
+        # SDD: Only 1 edge type ("other") instead of 3 (other, l2a, g2a)
         self.wkvs = nn.ModuleList([
             nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
             nn.Linear(args.hidden_dim, self.n_head * d_k * 2, bias=False),
             )
-            for _ in range(3)
         ])
         self.attn_fc = nn.Sequential(
             nn.Linear(self.n_head * d_v, self.d_model, bias=True),
             nn.Dropout(args.dropout),
         )
-        
+
         self.ffn = PositionwiseFeedForward(self.d_model, self.d_model*4, args.dropout, args)
 
     def forward(self, raw_q, raw_kv_lis, raw_kv_indices, input_dic):
         all_q_lis = self.wq(raw_q).view(raw_q.shape[0], self.num_prediction*self.n_head, self.head_dim)
-        all_kv_lis = [self.wkvs[_](torch.cat(raw_kv_lis[_], dim=0)) for _ in range(3)]
+        # SDD: Only process 1 edge type
+        all_kv_lis = [self.wkvs[0](torch.cat(raw_kv_lis[0], dim=0))]
         all_kv_lis = [[_[raw_kv_indices[_index][indices_i-1]:raw_kv_indices[_index][indices_i]] for indices_i in range(1, len(raw_kv_indices[_index]))] for _index, _ in enumerate(all_kv_lis)]
-        all_kv_lis = [torch.cat([all_kv_lis[0][_], all_kv_lis[1][_], all_kv_lis[2][_]], dim=0).view(-1, self.n_head, self.head_dim*2).unsqueeze(1).repeat(1, self.num_prediction, 1, 1).view(-1, self.num_prediction*self.n_head, self.head_dim*2).transpose(0, 1) for _ in range(raw_q.shape[0])]
+        # SDD: Only 1 edge type to concatenate (not 3)
+        all_kv_lis = [all_kv_lis[0][_].view(-1, self.n_head, self.head_dim*2).unsqueeze(1).repeat(1, self.num_prediction, 1, 1).view(-1, self.num_prediction*self.n_head, self.head_dim*2).transpose(0, 1) for _ in range(raw_q.shape[0])]
 
         all_out_q_lis = self.attn_fc(torch.cat([self.attention(q=all_q_lis[_].unsqueeze(1), k=all_kv_lis[_][..., :self.head_dim], v=all_kv_lis[_][..., self.head_dim:])[0].view(-1, self.num_prediction, self.n_head*self.head_dim) if all_kv_lis[_].shape[0]!=0 else torch.zeros_like(raw_q[0:1, :, :]) for _ in range(raw_q.shape[0])], dim=0)) + raw_q
         return self.ffn(all_out_q_lis)
@@ -699,25 +706,26 @@ class RefineContextModule(nn.Module):
         self.modal_emb = nn.parameter.Parameter(torch.zeros(args.num_prediction, args.hidden_dim))
         torch.nn.init.normal(self.modal_emb)      
         self.init_q = MLP(args.hidden_dim*2, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, prenorm=True)
-        self.etype2hidden_name = {"other":"a_e_hidden", "l2a":"l_e_hidden", "g2a":"g_e_hidden"}
+        # SDD: Only "other" edge type (agent-to-agent)
+        self.etype2hidden_name = {"other": "a_e_hidden"}
         self.refine_context_layer = nn.ModuleList([RefineContextLayer(args) for _ in range(2)])
 
     def forward(self, agent_ids, input_dic):
         with input_dic["graph_lis"].local_scope():
             self.device = "cuda:"+str(input_dic["gpu"])
-            raw_agent_fea = input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][agent_ids]
+            raw_agent_fea = input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"][agent_ids]
             num_agent = raw_agent_fea.shape[0]
 
             raw_q = torch.cat([raw_agent_fea.unsqueeze(1).repeat(1, self.num_prediction, 1), self.modal_emb.unsqueeze(0).repeat(num_agent, 1, 1)], dim=-1)
             raw_q = self.init_q(raw_q) + self.modal_emb
-            
-            raw_kv_lis = [[torch.zeros((0, self.hidden_dim), device=self.device)]*num_agent for _ in range(3)]
+
+            # SDD: Only process "other" edges (1 edge type instead of 3)
+            raw_kv_lis = [[torch.zeros((0, self.hidden_dim), device=self.device)]*num_agent]
             for agent_index, agent_id in enumerate(agent_ids):
-                for etype_index, etype in enumerate(["other", "l2a", "g2a"]):
-                    now_type_eid_lis = input_dic["graph_lis"].in_edges(etype=etype, v=agent_id, form="eid")
-                    if len(now_type_eid_lis) > 0:
-                        raw_kv_lis[etype_index][agent_index] = input_dic["graph_lis"].edges[etype].data[self.etype2hidden_name[etype]][now_type_eid_lis]
-            
+                now_type_eid_lis = input_dic["graph_lis"].in_edges(etype="other", v=agent_id, form="eid")
+                if len(now_type_eid_lis) > 0:
+                    raw_kv_lis[0][agent_index] = input_dic["graph_lis"].edges["other"].data["a_e_hidden"][now_type_eid_lis]
+
             raw_kv_length = [[int(__.shape[0]) for __ in _] for _ in raw_kv_lis]
             raw_kv_indices = [np.cumsum([0]+_) for _ in raw_kv_length]
             for _ in range(len(self.refine_context_layer)):
@@ -738,23 +746,28 @@ class RefineLayer(nn.Module):
         RefineCNN(d_hid, dilation=1, args=args),
         )
         self.out_linear = MLP(d_hid, d_hid, 2, norm=None)
-    def forward(self, x, context):
-        x = x.view(x.shape[0], x.shape[1], 91, -1)
+    def forward(self, x, context, args):
+        # Calculate total timesteps: obs_len + pred_len
+        total_timesteps = args.obs_len + args.pred_len
+        x = x.view(x.shape[0], x.shape[1], total_timesteps, -1)
         output = self.in_linear(x)
-        context = self.context_mlp(context).unsqueeze(-2).repeat(1, 1, 91, 1)
+        context = self.context_mlp(context).unsqueeze(-2).repeat(1, 1, total_timesteps, 1)
         output = self.fuse_linear(torch.cat([context, output], dim=-1))
         bs, num_mode, t_len, hid = output.shape
         output = output.view(bs*num_mode, t_len, hid).transpose(1, 2)
-        output = self.cnns(output).transpose(1, 2).view(bs, num_mode, t_len, hid)[:, :, 11:, :]
+        # Remove observation timesteps, keep only prediction timesteps
+        output = self.cnns(output).transpose(1, 2).view(bs, num_mode, t_len, hid)[:, :, args.obs_len:, :]
         output = self.out_linear(output)
         return output
 
 class RefineDecoder(nn.Module):
     def __init__(self, args):
-        super().__init__()        
+        super().__init__()
         self.hidden_dim = args.hidden_dim
         self.num_prediction = int(args.num_prediction)
-        
+        self.args = args  # Store args for later use
+        self.pred_len = args.pred_len  # Store prediction length
+
         self.refine_num = int(args.refine_num)
         self.refine_layer_lis = nn.ModuleList(
             [RefineLayer(2, self.hidden_dim//4, args) for _ in range(self.refine_num)]
@@ -763,13 +776,13 @@ class RefineDecoder(nn.Module):
         self.is_cumsum_vel = (args.cumsum_vel == "True")
 
         self.refine_context_attn = RefineContextModule(args)
-        
+
         self.reg_mlp = nn.Sequential(
             nn.Linear(args.hidden_dim, args.hidden_dim*2),
             nn.ReLU(inplace=True),
             nn.Linear(args.hidden_dim*2, args.hidden_dim*4),
             nn.ReLU(inplace=True),
-            nn.Linear(args.hidden_dim*4, 80*2),
+            nn.Linear(args.hidden_dim*4, args.pred_len*2),  # Use args.pred_len instead of 80
         )
         
         self.cls_mlp = nn.Sequential(
@@ -783,7 +796,7 @@ class RefineDecoder(nn.Module):
         
     def forward(self, target_agent_fea, agent_ids, agent_raw_traj, input_dic):
         refine_context = self.refine_context_attn(agent_ids, input_dic)/10.0
-        reg_res = self.reg_mlp(refine_context).view(target_agent_fea.shape[0], self.num_prediction, 80, 2)
+        reg_res = self.reg_mlp(refine_context).view(target_agent_fea.shape[0], self.num_prediction, self.pred_len, 2)
         cls_res = self.cls_mlp(refine_context).view(target_agent_fea.shape[0], self.num_prediction)
         if self.is_output_vel and self.is_cumsum_vel:
             reg_res = torch.cumsum(reg_res, dim=-2)
@@ -792,7 +805,7 @@ class RefineDecoder(nn.Module):
             now_agent_raw_traj = agent_raw_traj[agent_ids].unsqueeze(1).repeat(1, self.num_prediction, 1, 1)
             for _ in range(self.refine_num):
                 now_input = torch.cat([now_agent_raw_traj, reg_res.detach()], dim=-2).view(reg_res.shape[0], self.num_prediction, -1) ## Full Traj
-                reg_res = reg_res + self.refine_layer_lis[_](now_input, refine_context).view(reg_res.shape[0], self.num_prediction, 80, 2)
+                reg_res = reg_res + self.refine_layer_lis[_](now_input, refine_context, self.args).view(reg_res.shape[0], self.num_prediction, self.pred_len, 2)
                 reg_res_lis.append(reg_res)
         return cls_res, torch.stack(reg_res_lis, dim=1)
 
