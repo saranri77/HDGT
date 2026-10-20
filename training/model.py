@@ -1,43 +1,3 @@
-"""
-model.py
-========
-
-Self-contained copy of the full HDGT model in which the goal predictor is a
-**multimodal K-head Winner-Takes-All (MTP-style) predictor** `GoalPredictorMTP`:
-
-    agent_features (N, hidden) -> K candidate goals (N, K, 2) + confidences (N, K)
-
-with K = args.num_prediction (= number of DDIM chains), so each diffusion chain
-is conditioned on its OWN goal mode at inference. Multimodality comes from the
-loss structure (winner-takes-all: only the head closest to GT gets regression
-gradient, so heads specialize into distinct modes), NOT from a latent — there is
-no KL and posterior collapse is structurally impossible.
-
-Loss = WTA regression (relaxed top-3 during the curriculum ramp, annealing to
-top-1); without a scorer, + 0.5 * cross-entropy on the winner index (trains the
-confidence head).
-
-Ranking the K refined chains (index 0 is what single-trajectory metrics read):
-  - --scorer_type mode: ModeScorer, hand-made geometric features of each chain
-  - --scorer_type traj: TrajScorer, the raw chains with attention across them
-    and to the neighbours
-  - --use_scorer False: no scorer; the model is just goal-aware and behaves
-    like hdgt_goal_WTA_regressor (confidence head trained, chains left in the
-    goal heads' order)
-The scorer's loss (weight --scorer_loss_weight) starts once the goal curriculum
-is done. Every scorer input is detached, so it can only move the scorer.
-
-Training conditioning:
-  - diffusion training_forward: winner goal blended with GT via the curriculum
-    (the GT trajectory's endpoint ~= winner goal, so this is consistent).
-  - ddim_sample + refiner: per-chain goals (N, K, 2), each blended with GT via
-    the curriculum — at alpha=1 this exactly matches inference.
-
-This file has NO dependency on model_goal.py; it is meant to be deployed alone
-alongside train.py and sdd_dataset.py. The main class is `HDGT_model`
-so the train/test scripts (which call model_module.HDGT_model) work unchanged.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -478,196 +438,6 @@ class GoalEmbedder(nn.Module):
         return self.mlp(goal_pos)
 
 
-class GoalPredictorMTP(nn.Module):
-    """
-    Multimodal goal predictor (MTP-style): K candidate endpoints + confidences.
-
-        agent_features (N, hidden) -> goals (N, K, 2), logits (N, K)
-
-    A shared MLP trunk feeds two linear heads. Multimodality is enforced by the
-    winner-takes-all loss (computed in HDGT_model.forward), which lets each of
-    the K heads specialize on a distinct future mode instead of averaging them.
-    No latent, no KL — nothing can collapse.
-
-    `with_conf_head` controls the legacy blind confidence head. When the
-    ModeScorer is in use it is built with with_conf_head=False, so the trunk
-    that produces the goals receives gradient ONLY from the WTA regression.
-    That matters: in scaled units the WTA MSE is ~1e-2 while a 20-way
-    cross-entropy is ~2-3, so a conf head on this shared trunk trains the trunk
-    almost entirely for ranking and starves the regression it is sharing.
-    """
-    def __init__(self, hidden_dim, num_modes, with_conf_head=True):
-        super().__init__()
-        self.num_modes = num_modes
-        self.trunk = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.goal_head = nn.Linear(hidden_dim, num_modes * 2)
-        self.conf_head = nn.Linear(hidden_dim, num_modes) if with_conf_head else None
-
-    def forward(self, agent_features):
-        h = self.trunk(agent_features)
-        goals = self.goal_head(h).view(-1, self.num_modes, 2)  # (N, K, 2)
-        logits = self.conf_head(h) if self.conf_head is not None else None  # (N, K)
-        return goals, logits
-
-
-class ModeScorer(nn.Module):
-    """
-    Permutation-equivariant scorer over the K generated candidates.
-
-    Replaces the blind `conf_head`, which had three defects:
-      1. it was trained on the GOAL winner (argmin |g_k - gt_goal|) but used at
-         inference to rank TRAJECTORIES — and chain k drifts from goal k, has
-         its own DDIM seed, and argmin-FDE != argmin-ADE;
-      2. logit k was `u_k . h + d_k`, so it never saw the candidate it scores;
-         slot k had to be recognised by a slot-specific linear detector even
-         though slot semantics drift across agent types and speeds;
-      3. hard cross-entropy over ~5 near-tied plausible modes converges to the
-         posterior (~0.2 each), so the top of the ranking is decided by noise.
-
-    Here every mode is scored from its OWN content with weights SHARED across
-    modes, and a Deep-Sets mean-subtraction couples the modes so the score is
-    comparative — ranking is inherently a relative judgement. Two outputs:
-
-        logit_k   -> softmax ranking, trained on the trajectory winner
-        log_err_k -> predicted log ADE of chain k, trained on ALL K modes
-
-    The regression head is what gives every mode a gradient (cross-entropy only
-    ever supervises one) and what gives an ABSOLUTE, calibrated score; a softmax
-    over K is relative-within-agent by construction and cannot provide one.
-
-    Every input is detached: this module cannot move the encoder, the goal
-    predictor, the denoiser or the refiner.
-    """
-
-    # per-mode features: goal(2) + goal-consensus(2) + goal-ballistic(2)
-    #                    + endpoint(2) + drift(2) + spread(1) + path length(1)
-    N_GEOM = 12
-
-    def __init__(self, hidden_dim, pred_len, d_model=64, dropout=0.0):
-        super().__init__()
-        self.pred_len = pred_len
-        n_in = self.N_GEOM + 2 * pred_len          # + the path shape
-        self.in_proj = nn.Linear(n_in, d_model)
-        self.ctx_proj = nn.Linear(hidden_dim, d_model)
-        self.mix = nn.Linear(2 * d_model, d_model)
-        self.out_proj = nn.Linear(d_model, 2)      # [logit, log_err]
-        # Dropout on the two hidden layers (--scorer_dropout); none by default
-        self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-
-    @staticmethod
-    def build_features(goals, trajs, obs_traj, pred_len):
-        """
-        Args:
-            goals:    (N, K, 2)  candidate goals, agent frame, scaled
-            trajs:    (N, K, T, 2) candidate POSITIONS, relative to last obs
-            obs_traj: (N, obs_len, 2) observed positions, same frame
-        Returns:
-            (N, K, N_GEOM + 2T) per-mode feature tensor
-        """
-        n, k, t, _ = trajs.shape
-        v0 = (obs_traj[:, -1, :] - obs_traj[:, -2, :]).unsqueeze(1)   # (N,1,2)
-        ballistic = v0 * float(pred_len)                              # constant-velocity endpoint
-        consensus = goals.mean(dim=1, keepdim=True)                   # (N,1,2)
-        end = trajs[:, :, -1, :]                                      # (N,K,2)
-
-        prev = torch.cat([torch.zeros_like(trajs[:, :, :1, :]), trajs[:, :, :-1, :]], dim=2)
-        path_len = (trajs - prev).norm(dim=-1).sum(dim=-1, keepdim=True)   # (N,K,1)
-        spread = (goals - consensus).norm(dim=-1, keepdim=True)            # (N,K,1)
-        # path shape, endpoint-centred so it carries curvature not position
-        shape = (trajs - end.unsqueeze(2)).reshape(n, k, t * 2)
-
-        return torch.cat([
-            goals,                    # where this mode wants to go
-            goals - consensus,        # how far it sits from the consensus of the K heads
-            goals - ballistic,        # how far it deviates from constant velocity
-            end,                      # where the chain actually ended up
-            end - goals,              # goal-following drift — invisible to the old head
-            spread,
-            path_len,
-            shape,
-        ], dim=-1)
-
-    def forward(self, agent_features, goals, trajs, obs_traj):
-        feat = self.build_features(
-            goals.detach(), trajs.detach(), obs_traj.detach(), self.pred_len
-        )
-        h = self.drop(torch.relu(self.in_proj(feat) + self.ctx_proj(agent_features.detach()).unsqueeze(1)))
-        pooled = h.mean(dim=1, keepdim=True).expand_as(h)
-        h = self.drop(torch.relu(self.mix(torch.cat([h, pooled], dim=-1))))
-        out = self.out_proj(h)                       # (N, K, 2)
-        return out[..., 0], out[..., 1]              # logits, log_err
-
-
-class TrajScorer(nn.Module):
-    """
-    Candidate-aware confidence scorer (fix 3): ranks the K generated chains.
-
-        logits_k = score(trajectory_k, kinematics, agent features, neighbors)
-
-    Unlike the old blind conf head (K logits from agent features alone, never
-    seeing what it ranked), this scores each candidate explicitly:
-      - per-candidate embedding of the full trajectory + endpoint + ballistic
-        residual (endpoint minus constant-velocity extrapolation = "kinematic
-        surprise" of this candidate)
-      - fused with the agent feature
-      - self-attention ACROSS the K candidates (ranking is relative — letting
-        candidates see each other makes the score listwise)
-      - cross-attention to neighbor context (a chain that cuts through a
-        neighbor can be ranked down)
-    All inputs are detached upstream: confidence never trains the encoder,
-    decoder, or refiner. At inference it scores the refined trajectories; the
-    same module can later score bridge prior means mu_k (they are trajectories
-    too), which keeps it compatible with confidence-modulated tube width.
-    """
-    def __init__(self, hidden_dim, pred_len, dropout=0.1):
-        super().__init__()
-        d = hidden_dim
-        in_dim = pred_len * 2 + 4  # flat trajectory + endpoint (2) + ballistic residual (2)
-        self.cand_embed = nn.Sequential(
-            nn.Linear(in_dim, d),
-            nn.ReLU(inplace=True),
-            nn.Linear(d, d),
-        )
-        self.agent_proj = nn.Linear(d, d)
-        self.self_norm = nn.LayerNorm(d)
-        self.self_attn = nn.MultiheadAttention(d, 4, dropout=dropout, batch_first=True)
-        self.cross_norm = nn.LayerNorm(d)
-        self.cross_attn = nn.MultiheadAttention(d, 4, dropout=dropout, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
-            nn.SiLU(),
-            nn.Linear(d, d),
-        )
-        self.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1))
-
-    def forward(self, traj, v0, agent_feat, context, context_mask):
-        """
-        traj: (N, K, T, 2) candidate POSITION trajectories (agent frame, scaled)
-        v0:   (N, 2) last observed per-frame velocity
-        agent_feat: (N, H); context: (N, C, H); context_mask: (N, C) bool or None
-        returns logits (N, K)
-        """
-        N, K, T, _ = traj.shape
-        endpoint = traj[:, :, -1, :]                        # (N, K, 2)
-        ballistic = endpoint - (T * v0).unsqueeze(1)        # (N, K, 2)
-        x = torch.cat([traj.reshape(N, K, T * 2), endpoint, ballistic], dim=-1)
-        h = self.cand_embed(x) + self.agent_proj(agent_feat).unsqueeze(1)
-        hn = self.self_norm(h)
-        a, _ = self.self_attn(hn, hn, hn)
-        h = h + a
-        a, _ = self.cross_attn(self.cross_norm(h), context, context,
-                               key_padding_mask=context_mask)
-        h = h + a
-        h = h + self.ffn(h)
-        return self.out(h).squeeze(-1)                      # (N, K)
-
-
 class AdaLayerNorm(nn.Module):
     """Adaptive Layer Normalization conditioned on timestep embedding."""
     def __init__(self, hidden_dim):
@@ -950,11 +720,7 @@ class TransformerDiffusionDecoder(nn.Module):
 
         agent_features_exp = agent_features.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, self.hidden_dim)
         agent_types_exp = agent_types.unsqueeze(1).expand(-1, num_samples).reshape(-1)
-        # goal_pos can be (batch, 2) at train time or (batch, K, 2) at inference
-        if goal_pos.dim() == 3:  # (batch, K, 2) — distinct goal per DDIM chain
-            goal_pos_exp = goal_pos.reshape(-1, 2)
-        else:                    # (batch, 2) — same goal replicated across K chains
-            goal_pos_exp = goal_pos.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 2)
+        goal_pos_exp = goal_pos.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 2)
         context_exp = context.unsqueeze(1).expand(-1, num_samples, -1, -1).reshape(-1, context.shape[1], context.shape[2])
         if context_mask is not None:
             context_mask_exp = context_mask.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, context_mask.shape[1])
@@ -1138,11 +904,8 @@ class DiffusionRefiner(nn.Module):
         # Prepare context (agent features + modal embeddings + goal embedding)
         modal_emb_exp = self.modal_emb.unsqueeze(0).expand(batch_size, -1, -1)
         agent_features_exp = agent_features.unsqueeze(1).expand(-1, num_samples, -1)
-        # goal_pos can be (batch, 2) or (batch, K, 2) — GoalEmbedder handles (..., 2)
-        if goal_pos.dim() == 3:  # (batch, K, 2) — distinct goal per sample
-            goal_emb_exp = self.goal_embed(goal_pos)  # (batch, K, hidden_dim)
-        else:                    # (batch, 2) — replicate
-            goal_emb_exp = self.goal_embed(goal_pos).unsqueeze(1).expand(-1, num_samples, -1)
+        goal_emb = self.goal_embed(goal_pos)  # (batch, hidden_dim)
+        goal_emb_exp = goal_emb.unsqueeze(1).expand(-1, num_samples, -1)
         context = torch.cat([agent_features_exp, goal_emb_exp, modal_emb_exp], dim=-1)
         context = self.context_proj(context)
         
@@ -1168,11 +931,8 @@ class DiffusionRefiner(nn.Module):
             all_steps.append(refined_pred)
 
         # Compute goal penalty: average distance from final positions to goal across all refinement steps
-        if goal_pos.dim() == 3:  # (batch, K, 2) — align with (batch, steps, K, 2)
-            goal_pos_exp = goal_pos.unsqueeze(1).expand(-1, len(all_steps), -1, -1)
-        else:                    # (batch, 2)
-            goal_pos_exp = goal_pos.unsqueeze(1).unsqueeze(1).expand(-1, len(all_steps), num_samples, -1)
-        all_final_positions = torch.stack([step[:, :, -1, :] for step in all_steps], dim=1)  # (batch, steps, K, 2)
+        goal_pos_exp = goal_pos.unsqueeze(1).unsqueeze(1).expand(-1, len(all_steps), num_samples, -1)
+        all_final_positions = torch.stack([step[:, :, -1, :] for step in all_steps], dim=1)  # (batch, steps, num_samples, 2)
         goal_penalty = torch.mean((all_final_positions - goal_pos_exp) ** 2)
 
         if return_all_steps:
@@ -1187,11 +947,6 @@ class DiffusionRefiner(nn.Module):
 # Main Model: HDGT with Diffusion + Refiner
 # =============================================================================
 
-def flag_on(value):
-    """A flag that may arrive as a bool or as argparse's "True"/"False" string"""
-    return value in (True, 'True', 'true', '1')
-
-
 class HDGT_model(nn.Module):
     """
     HDGT model with diffusion decoder and refiner.
@@ -1201,12 +956,9 @@ class HDGT_model(nn.Module):
         2. Diffusion Decoder: Generates diverse K samples (noise prediction)
         3. Refiner: Polishes samples for accuracy (5 iterations)
 
-    Training Losses (3-LOSS):
+    Training Losses (2-LOSS):
         1. Diffusion Loss: noise prediction + alpha_t-weighted goal penalty
-        2. Multi-Step Refiner Loss: best-of-K distance to GT (no goal penalty)
-        3. Goal Loss: K-head WTA regression (+ confidence cross-entropy without a scorer)
-        4. Scorer Loss: ranks the K refined chains (ModeScorer or TrajScorer), weight
-           --scorer_loss_weight, once the goal curriculum is done
+        2. Multi-Step Refiner Loss: Averaged over all 6 steps + goal penalty
     """
     def __init__(self, input_dim, args):
         super().__init__()
@@ -1217,59 +969,17 @@ class HDGT_model(nn.Module):
         self.pred_len = args.pred_len
         self.obs_len = args.obs_len
         
-        # LOSS WEIGHTS
-        self.diffusion_loss_weight = 1.0
-        self.refiner_loss_weight = 1.0
-        self.goal_loss_weight = getattr(args, 'goal_loss_weight', 0.5)
-
-        self.use_refiner = getattr(args, 'use_refiner', True)
-
-        # The scorer ranks the K refined chains, so it needs them: it is only
-        # available with the refiner on (that branch generates candidates during
-        # training). --scorer_type picks ModeScorer or TrajScorer. With
-        # --use_scorer False the model is just goal-aware, as in
-        # hdgt_goal_WTA_regressor: the goal predictor keeps its confidence head
-        # and the chains stay in the goal heads' order.
-        self.use_scorer = flag_on(getattr(args, 'use_scorer', True)) and self.use_refiner
-        self.scorer_type = getattr(args, 'scorer_type', 'mode')
-        if self.scorer_type not in ('mode', 'traj'):
-            raise ValueError(f"--scorer_type must be 'mode' or 'traj', got {self.scorer_type!r}")
-        scorer_dropout = args.dropout if flag_on(getattr(args, 'scorer_dropout', False)) else 0.0
-        self.scorer_loss_weight = getattr(args, 'scorer_loss_weight', 0.5)
-        self.scorer_err_weight = getattr(args, 'scorer_err_weight', 1.0)    # ModeScorer only
-        # TrajScorer's soft ranking target (see _normalized_dist)
-        self.conf_tau_min = getattr(args, 'conf_tau_min', 0.02)
-        self.conf_sharpen = getattr(args, 'conf_sharpen', 1.0)
-        self.conf_goal_blend = getattr(args, 'conf_goal_blend', 0.5)
-
-        # Model components
+        # 2-LOSS WEIGHTS
+        self.diffusion_loss_weight = 1.0   # noise prediction + goal penalty
+        self.refiner_loss_weight = 1.0     # Refiner learns positions + goal penalty
+        
+        # Three components
         self.encoder = HDGT_encoder(input_dim, args)
         self.diffusion_decoder = TransformerDiffusionDecoder(args)
         self.refiner = DiffusionRefiner(args)
-        self.goal_predictor = GoalPredictorMTP(
-            args.hidden_dim, num_modes=self.num_samples,
-            with_conf_head=not self.use_scorer,
-        )
-        self.mode_scorer = (
-            ModeScorer(args.hidden_dim, self.pred_len, dropout=scorer_dropout)
-            if self.use_scorer and self.scorer_type == 'mode' else None
-        )
-        self.traj_scorer = (
-            TrajScorer(args.hidden_dim, self.pred_len, dropout=scorer_dropout)
-            if self.use_scorer and self.scorer_type == 'traj' else None
-        )
-
-        # Controlled by training loop each epoch (start at 0 → ramp up)
-        self.goal_curriculum_alpha = 0.0  # 0 = full oracle, 1 = full predicted goal
-
-    def _normalized_dist(self, d):
-        """Per-agent distances (N, K) -> 0 for the best chain, 1 at the median one: the
-        scale of TrajScorer's soft target no longer depends on how far off the agent is"""
-        d_min = d.min(dim=1, keepdim=True).values
-        d_med = d.median(dim=1, keepdim=True).values
-        tau = (d_med - d_min).clamp_min(self.conf_tau_min)
-        return (d - d_min) / tau
-
+        
+        self.use_refiner = getattr(args, 'use_refiner', True)
+        
     def forward(self, input_dic):
         """
         Forward pass for training and inference.
@@ -1316,67 +1026,15 @@ class HDGT_model(nn.Module):
             for agent_type_idx in range(6)
         ]
 
+        # Extract goal positions (needed for both training and inference)
+        goal_pos = input_dic["goal_pos_lis"]
+
         if self.training:
             # ═════════════════════════════════════════════════════════════
-            # TRAINING MODE: 3 LOSSES (Goal Regressor + Diffusion + Refiner)
+            # TRAINING MODE: 2 LOSSES (Noise Prediction + Multi-Step Refiner)
             # ═════════════════════════════════════════════════════════════
-            labels_vel = input_dic["label_lis"]      # velocities for diffusion
-            labels_pos = input_dic["label_pos_lis"]  # positions for refiner
-            gt_goal = input_dic["goal_pos_lis"]      # GT goal endpoint (regressor target)
-
-            # ─────────────────────────────────────────────────────────────
-            # LOSS 3: Multimodal Goal Predictor (K-head Winner-Takes-All)
-            # ─────────────────────────────────────────────────────────────
-            # Detach encoder features so goal gradients don't flow into the
-            # encoder. The goal predictor is a projection head that reads
-            # encoder outputs — the encoder is trained by diffusion + refiner.
-            predicted_goals, goal_logits = self.goal_predictor(target_agent_features.detach())
-            # predicted_goals: (N, K, 2), goal_logits: (N, K)
-
-            # Per-head squared distance to the GT endpoint
-            goal_dists = ((predicted_goals - gt_goal.unsqueeze(1)) ** 2).mean(dim=-1)  # (N, K)
-            winner_idx = goal_dists.argmin(dim=1)  # (N,)
-
-            # Relaxed WTA: while the curriculum is still ramping (alpha < 1),
-            # spread the regression loss over the top-3 closest heads so no head
-            # dies before it ever wins; afterwards, pure top-1 winner-takes-all.
-            if self.goal_curriculum_alpha < 1.0:
-                topk = min(3, goal_dists.shape[1])
-                goal_wta_loss = goal_dists.topk(topk, dim=1, largest=False).values.mean()
-            else:
-                goal_wta_loss = goal_dists.gather(1, winner_idx.unsqueeze(1)).mean()
-
-            # Confidence head: learn which GOAL is closest to the GT goal. Only
-            # there without a scorer (as in hdgt_goal_WTA_regressor) — see
-            # ModeScorer for why this target is the wrong one for ranking.
-            if goal_logits is not None:
-                goal_cls_loss = F.cross_entropy(goal_logits, winner_idx)
-                goal_loss = goal_wta_loss + 0.5 * goal_cls_loss
-            else:
-                goal_loss = goal_wta_loss
-            # Logged separately: best-head MSE — the interpretable goal quality
-            # (pixel RMSE = sqrt(value) * 50). Occupies the old goal_recon slot.
-            goal_recon_loss = goal_dists.gather(1, winner_idx.unsqueeze(1)).mean().detach()
-
-            # Goal curriculum, two forms:
-            # (a) winner blend (N, 2) for the diffusion noise-prediction loss —
-            #     the GT trajectory's endpoint ~= winner goal, so conditioning
-            #     the denoiser on this blend stays consistent with its label.
-            winner_goal = predicted_goals.gather(
-                1, winner_idx.view(-1, 1, 1).expand(-1, 1, 2)
-            ).squeeze(1)  # (N, 2)
-            effective_goal = (
-                self.goal_curriculum_alpha * winner_goal.detach() +
-                (1.0 - self.goal_curriculum_alpha) * gt_goal
-            )
-            # (b) per-chain blend (N, K, 2) for ddim_sample + refiner — chain k
-            #     is conditioned on head k. At alpha=0 every chain sees GT (old
-            #     behavior); at alpha=1 each chain sees its own predicted mode,
-            #     exactly matching inference conditions.
-            effective_goals_k = (
-                self.goal_curriculum_alpha * predicted_goals.detach() +
-                (1.0 - self.goal_curriculum_alpha) * gt_goal.unsqueeze(1)
-            )
+            labels_vel = input_dic["label_lis"]  # Velocities for diffusion
+            labels_pos = input_dic["label_pos_lis"]  # Positions for refiner
 
             # ─────────────────────────────────────────────────────────────
             # LOSS 1: Noise prediction + alpha_t-weighted goal penalty
@@ -1386,24 +1044,24 @@ class HDGT_model(nn.Module):
                 target_agent_ids,
                 target_agent_types,
                 labels_vel,
-                effective_goal,
+                goal_pos,
                 input_dic
             )
             diffusion_loss = F.mse_loss(predicted_noise, actual_noise) + goal_penalty
 
             # ─────────────────────────────────────────────────────────────
-            # LOSS 2: Multi-Step Refiner
+            # LOSS 2: Multi-Step Refiner (Like Original HDGT)
             # ─────────────────────────────────────────────────────────────
             refiner_loss = torch.tensor(0.0, device=predicted_noise.device)
-            scorer_term = torch.tensor(0.0, device=predicted_noise.device)
 
             if self.use_refiner:
+                # Generate K diverse samples (with torch.no_grad for stability)
                 with torch.no_grad():
                     diffusion_samples = self.diffusion_decoder.ddim_sample(
                         target_agent_features,
                         target_agent_ids,
                         target_agent_types,
-                        effective_goals_k,   # (N, K, 2): chain k conditioned on head k
+                        goal_pos,
                         input_dic,
                         num_samples=self.num_samples,
                         ddim_steps=20
@@ -1411,14 +1069,17 @@ class HDGT_model(nn.Module):
 
                 obs_trajectories = all_agent_raw_traj[target_agent_ids]
 
-                all_refined_steps, _ = self.refiner(
+                # Get ALL refinement steps (not just final!)
+                # Output shape: (batch, 6_steps, K_samples, pred_len, 2)
+                all_refined_steps, refiner_goal_penalty = self.refiner(
                     diffusion_samples,
                     obs_trajectories,
                     target_agent_features,
-                    effective_goals_k,   # (N, K, 2): per-chain goal conditioning
+                    goal_pos,
                     return_all_steps=True
                 )
 
+                # Compute distance at EVERY step (like original HDGT)
                 label_positions_exp = labels_pos.unsqueeze(1).unsqueeze(1).expand(
                     -1, all_refined_steps.shape[1], self.num_samples, -1, -1
                 )
@@ -1426,170 +1087,55 @@ class HDGT_model(nn.Module):
                     ((all_refined_steps - label_positions_exp) ** 2).sum(dim=-1).mean(dim=-1)
                 )  # (batch, 6_steps, K_samples)
 
-                best_mode_idx = distances[:, -1, :].argmin(dim=-1)
+                # Find best mode based on FINAL refinement step
+                best_mode_idx = distances[:, -1, :].argmin(dim=-1)  # (batch,)
+
+                # Average loss over ALL refinement steps
                 best_mode_distances = distances[
                     torch.arange(distances.shape[0]),
                     :,
                     best_mode_idx
                 ]  # (batch, 6_steps)
 
-                # No refiner goal penalty: best_mode_distances already supervises the
-                # full trajectory (endpoint included) against the GT trajectory, which
-                # is strictly more accurate than pushing the endpoint toward a predicted
-                # goal. The goal still conditions the refiner as an input; we just don't
-                # add a separate penalty that would fight the GT supervision.
-                refiner_loss = best_mode_distances.mean()
-
-                # ─────────────────────────────────────────────────────────
-                # LOSS 4: scorer — rank the chains we actually select from
-                # ─────────────────────────────────────────────────────────
-                if self.use_scorer:
-                    final_traj = all_refined_steps[:, -1].detach()   # (N, K, T, 2)
-
-                    if self.scorer_type == 'mode':
-                        # Per-chain ADE, the SAME definition the report ranks on.
-                        # (refiner_loss above uses RMSE-over-time; its argmin is a
-                        # slightly different chain, so do not reuse best_mode_idx.)
-                        ade_k = (final_traj - labels_pos.unsqueeze(1)).norm(dim=-1).mean(dim=-1)
-                        ade_winner = ade_k.argmin(dim=1)                 # (N,)
-
-                        scorer_logits, scorer_log_err = self.mode_scorer(
-                            target_agent_features, effective_goals_k,
-                            final_traj, obs_trajectories,
-                        )
-                        scorer_cls_loss = F.cross_entropy(scorer_logits, ade_winner)
-                        scorer_err_loss = F.smooth_l1_loss(
-                            scorer_log_err, torch.log(ade_k + 1e-3)
-                        )
-                        scorer_loss = scorer_cls_loss + self.scorer_err_weight * scorer_err_loss
-                        self.last_scorer_err = scorer_err_loss.detach()
-                    else:
-                        # TrajScorer: soft target softmax(-z), z = each chain's path
-                        # error plus conf_goal_blend x its goal error, both scaled
-                        # per agent (see _normalized_dist)
-                        v0 = (obs_trajectories[:, -1] - obs_trajectories[:, -2]).detach()
-                        with torch.no_grad():
-                            ctx, ctx_mask = self.diffusion_decoder.get_context_features(
-                                target_agent_ids, input_dic)
-                        scorer_logits = self.traj_scorer(
-                            final_traj, v0, target_agent_features.detach(), ctx, ctx_mask)
-                        goal_eucl = (predicted_goals.detach() - gt_goal.unsqueeze(1)).norm(dim=-1)
-                        d_traj = distances[:, -1, :].detach()
-                        z = self.conf_sharpen * (self._normalized_dist(d_traj)
-                                                 + self.conf_goal_blend * self._normalized_dist(goal_eucl))
-                        soft_target = F.softmax(-z, dim=1)
-                        scorer_cls_loss = F.kl_div(F.log_softmax(scorer_logits, dim=1), soft_target,
-                                                   reduction='batchmean')
-                        scorer_loss = scorer_cls_loss
-                        self.last_scorer_err = None
-
-                    # Before the curriculum completes, every chain is conditioned
-                    # on a goal blended toward GT, so the ranking target is noise.
-                    # Gate with a float rather than skipping the term, so the
-                    # scorer's parameters still receive (zero) gradient and DDP
-                    # does not need find_unused_parameters.
-                    gate = 1.0 if self.goal_curriculum_alpha >= 1.0 else 0.0
-                    scorer_term = gate * self.scorer_loss_weight * scorer_loss
-                    # Stashed UNGATED so the log shows the scorer's true state
-                    # even while it is still gated off.
-                    self.last_scorer_loss = scorer_loss.detach()
-                    self.last_scorer_cls = scorer_cls_loss.detach()
+                refiner_loss = best_mode_distances.mean() + refiner_goal_penalty
 
             # ─────────────────────────────────────────────────────────────
             # TOTAL LOSS
             # ─────────────────────────────────────────────────────────────
-            # scorer_term is kept out of goal_loss on purpose: every scorer
-            # input is detached, so this term can only move the scorer's weights.
-            # Nothing it does can degrade the goal predictor or the generator.
             total_loss = (
                 self.diffusion_loss_weight * diffusion_loss +
-                self.refiner_loss_weight * refiner_loss +
-                self.goal_loss_weight * goal_loss +
-                scorer_term
+                self.refiner_loss_weight * refiner_loss
             )
 
-            return total_loss, diffusion_loss, refiner_loss, goal_loss, goal_recon_loss, pred_indice_bool_type_lis, target_agent_types
-
+            return total_loss, diffusion_loss, refiner_loss, pred_indice_bool_type_lis, target_agent_types
+        
         else:
             # ═════════════════════════════════════════════════════════════
-            # INFERENCE MODE: K multimodal goals, one per DDIM chain
+            # INFERENCE MODE: Generate diverse predictions
             # ═════════════════════════════════════════════════════════════
-            # Each of the K chains is conditioned on its own goal mode, matching
-            # the per-chain training conditioning at curriculum alpha=1.
-            # Diversity comes from K distinct goals AND K DDIM noise seeds.
-            predicted_goals, goal_logits = self.goal_predictor(
-                target_agent_features.detach()
-            )  # (batch, K, 2), (batch, K)
-
             trajectories = self.diffusion_decoder.ddim_sample(
                 target_agent_features,
                 target_agent_ids,
                 target_agent_types,
-                predicted_goals,
+                goal_pos,
                 input_dic,
                 num_samples=self.num_samples,
-                ddim_steps=20
+                ddim_steps=20  # High quality for inference
             )
 
-            obs_trajectories = all_agent_raw_traj[target_agent_ids]
-
             if self.use_refiner:
+                obs_trajectories = all_agent_raw_traj[target_agent_ids]
                 trajectories, _ = self.refiner(
                     trajectories,
                     obs_trajectories,
                     target_agent_features,
-                    predicted_goals,
-                    return_all_steps=False
+                    goal_pos,
+                    return_all_steps=False  # Only return final
                 )
-
-            # Rank the K chains so index 0 is the one we predict is best. This
-            # is a pure output permutation AFTER generation (the head-k <->
-            # modal-emb-k pairing seen during training is untouched):
-            # minADE/minFDE are unaffected, while single-mode ADE/FDE
-            # (preds[:, 0]) come from the ranking. Without a scorer the chains
-            # keep the goal heads' order, as in hdgt_goal_WTA_regressor.
-            self.last_pred_error = None
-            self.last_mode_probs = None
-            if self.use_scorer:
-                if self.scorer_type == 'mode':
-                    # Scored from the realised chains — same inputs as at training.
-                    scorer_logits, scorer_log_err = self.mode_scorer(
-                        target_agent_features, predicted_goals,
-                        trajectories, obs_trajectories,
-                    )
-                    conf_order = torch.argsort(scorer_logits, dim=1, descending=True)
-                    # Calibrated absolute error estimate, in scaled units, in the
-                    # same order as the returned chains (BRIDGE Stage D needs this;
-                    # a within-agent softmax cannot provide it).
-                    self.last_pred_error = torch.exp(
-                        scorer_log_err.gather(1, conf_order)
-                    ).detach()
-                else:
-                    v0 = obs_trajectories[:, -1] - obs_trajectories[:, -2]
-                    ctx, ctx_mask = self.diffusion_decoder.get_context_features(
-                        target_agent_ids, input_dic)
-                    scorer_logits = self.traj_scorer(
-                        trajectories, v0, target_agent_features.detach(), ctx, ctx_mask)
-                    conf_order = torch.argsort(scorer_logits, dim=1, descending=True)
-                # The scorer's probability for each chain, in the returned order
-                self.last_mode_probs = torch.softmax(scorer_logits, dim=1).gather(
-                    1, conf_order).detach()
-                trajectories = trajectories.gather(
-                    1,
-                    conf_order[:, :, None, None].expand(
-                        -1, -1, trajectories.shape[2], trajectories.shape[3]
-                    )
-                )
-                predicted_goals = predicted_goals.gather(
-                    1, conf_order[:, :, None].expand(-1, -1, 2))
-
-            # The goals in the same order as the returned chains (goal k belongs
-            # to chain k) for downstream consumers (visualization); attribute
-            # stash keeps the forward() return signature unchanged.
-            self.last_predicted_goals = predicted_goals.detach()
-
+            
+            # Flag to indicate output is positions (for metric calculation)
             self.output_is_positions = self.use_refiner
-
+            
             return trajectories, pred_indice_bool_type_lis, target_agent_types
 
 

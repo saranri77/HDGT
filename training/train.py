@@ -97,7 +97,7 @@ def restore_training_state(checkpoint, args, optimizer, scheduler, scaler, best_
     return start_epoch
 
 
-parser = argparse.ArgumentParser('HDGT Goal-CVAE Training - 3-Loss Architecture')
+parser = argparse.ArgumentParser('HDGT Diffusion Training - Clean 2-Loss Architecture')
 ##### Optimizer - Scheduler
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=1e-6, help='weight decay')
@@ -136,21 +136,6 @@ parser.add_argument('--dev_mode', type=str, default="False", help='development m
 parser.add_argument('--ddp_mode', type=str, default="False", help='DDP mode')
 parser.add_argument('--port', type=str, default="31243", help='DDP port')
 parser.add_argument('--amp', type=str, default="none", help='mixed precision: none, fp16, bf16')
-
-#### Goal Predictor (multimodal K-head WTA)
-parser.add_argument('--goal_loss_weight', type=float, default=0.5, help='weight on goal loss (WTA + confidence CE)')
-parser.add_argument('--goal_curriculum_epochs', type=int, default=10, help='epochs to ramp oracle→predicted goal')
-
-#### Scorer: ranks the K refined chains (index 0 = the single-trajectory prediction)
-parser.add_argument('--use_scorer', type=str, default="True", help='rank the K chains with a scorer; False = just goal-aware, as hdgt_goal_WTA_regressor (confidence head trained, chains left in the goal heads\' order)')
-parser.add_argument('--scorer_type', type=str, default="mode", choices=["mode", "traj"], help='mode = ModeScorer (hand-made features of each chain), traj = TrajScorer (raw chains, attention across them and to the neighbours)')
-parser.add_argument('--scorer_loss_weight', type=float, default=0.5, help='weight on the scorer loss, applied once the goal curriculum is done (isolated: cannot affect the generator); 0.5 = hdgt_bridge\'s effective weight')
-parser.add_argument('--scorer_err_weight', type=float, default=1.0, help='ModeScorer only: weight on the per-mode log-ADE regression inside its loss')
-parser.add_argument('--clip_scorer_separately', type=str, default="True", help='clip the scorer\'s gradients on their own, max norm 1.0 (True), or leave them unclipped (False); the rest of the model is always clipped on its own, never in one global clip')
-parser.add_argument('--scorer_dropout', type=str, default="False", help='use --dropout inside the scorer (True) or no dropout in it (False)')
-parser.add_argument('--conf_tau_min', type=float, default=0.02, help='TrajScorer only: floor for the adaptive soft-target temperature, scaled units (0.02 = 1 px)')
-parser.add_argument('--conf_goal_blend', type=float, default=0.5, help='TrajScorer only: weight of goal-space distance in the soft target')
-parser.add_argument('--conf_sharpen', type=float, default=1.0, help='TrajScorer only: sharpness of the soft target')
 
 #### Log
 parser.add_argument('--use_val_split', type=str, default="True", help='select checkpoints on the held-out VAL videos (True) instead of the test set (False, leaks)')
@@ -200,35 +185,6 @@ def cal_ade_fde(labels, preds, masks, scale_factor=1.0):
     return [ade, fde], [ade_cnt, fde_cnt]
 
 
-def flag_on(value):
-    """A flag that may arrive as a bool or as argparse's "True"/"False" string"""
-    return value in (True, 'True', 'true', '1')
-
-
-def clip_grads(model, max_norm=1.0, clip_scorer=True):
-    """Clip the rest of the model, and the scorer on its own (--clip_scorer_separately).
-
-    A single clip_grad_norm_ over all parameters couples modules that share
-    nothing: the scorer's gradient enters the GLOBAL norm, so a large scorer
-    gradient scales DOWN the encoder / decoder / refiner updates. Measured at
-    3.5% shrinkage on an untrained model, and the scorer's gradient is largest
-    exactly when it starts training (curriculum alpha reaches 1) — mid-run for
-    the generator. Clipping the two groups separately restores the isolation
-    that detaching the scorer's inputs was meant to provide.
-
-    There is never one global clip. clip_scorer=False leaves the scorer's
-    gradients unclipped; the rest of the model is always clipped on its own.
-    Without a scorer, the rest is the whole model.
-    """
-    m = model.module if hasattr(model, "module") else model
-    scorer, rest = [], []
-    for name, p in m.named_parameters():
-        (scorer if name.startswith(("mode_scorer", "traj_scorer")) else rest).append(p)
-    torch.nn.utils.clip_grad_norm_(rest, max_norm)
-    if clip_scorer and scorer:
-        torch.nn.utils.clip_grad_norm_(scorer, max_norm)
-
-
 def cal_min_ade_fde(preds, labels, masks, scale_factor=1.0):
     """Calculate minADE and minFDE over K samples in original pixel coordinates"""
     if labels.shape[0] == 0:
@@ -272,7 +228,7 @@ def main():
     global_seed = int(args.port)
     
     print("=" * 80)
-    print("HDGT DIFFUSION MODEL - 3-LOSS (Multimodal K-Goal WTA + Diffusion + Refiner)")
+    print("HDGT DIFFUSION MODEL - CLEAN 2-LOSS ARCHITECTURE")
     print("=" * 80)
     print(f"GPU Count: {gpu_count}, Seed: {global_seed}")
     print(f"Coordinate Scale: {SCALE_FACTOR} (metrics in original pixels)")
@@ -283,10 +239,9 @@ def main():
     print(" Decoder: Diffusion model (generates K diverse samples)")
     print(" Refiner: 5-step CNN refinement (like original HDGT)")
     print("-" * 80)
-    print("TRAINING LOSSES (3 LOSSES):")
-    print("  1. Diffusion Loss (weight=1.0): noise prediction + alpha_t-weighted goal penalty")
-    print("  2. Refiner Loss (weight=1.0): best-of-K distance to GT over 6 steps")
-    print("  3. Goal Loss (weight=0.5): K-head WTA regression + confidence CE")
+    print("TRAINING LOSSES (2 LOSSES - NO AUXILIARY):")
+    print("  1. Diffusion Loss (weight=1.0): x0-prediction reconstruction + goal")
+    print("  2. Refiner Loss (weight=1.0): Averaged over 6 steps (initial + 5 refinements)")
     print("-" * 80)
     print("KEY FEATURES:")
     print(" Multi-step refiner loss (equal gradient to all layers)")
@@ -328,8 +283,7 @@ def main_worker(gpu, gpu_count, global_seed, args):
 
     snapshot_dir = None
     writer = None
-    # One "best" per selection rule — see the saver in run_model for what each
-    # rule is for. Threaded through run_model in the old best_val_loss slot.
+    # One running best per selection rule (see VAL_SEED)
     best_val_loss = {"min_ade": float('inf'), "min_fde": float('inf')}
     
     if global_rank == 0:
@@ -370,7 +324,7 @@ def main_worker(gpu, gpu_count, global_seed, args):
         print("Loading checkpoint:", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"])
-
+    
     model = model.to(device, non_blocking=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     
@@ -429,13 +383,13 @@ def main_worker(gpu, gpu_count, global_seed, args):
         )
 
 
-def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, global_rank, gpu_count, is_train, args, val_dataloader=None, val_sample_num=None, snapshot_dir=None, scaler=None, amp_data_type=None, writer=None, best_val_loss=None):
+def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, global_rank, gpu_count, is_train, args, val_dataloader=None, val_sample_num=None, snapshot_dir=None, scaler=None, amp_data_type=None, writer=None, best_val_loss=float('inf')):
     
     length_lis = [int(args.pred_len * 0.4), int(args.pred_len * 0.65), args.pred_len]
     agent_type_lis = ["PEDESTRIAN", "BIKER", "CAR", "BUS", "CART", "SKATER"]
     metric_type_lis = ["ade", "fde", "min_ade", "min_fde"]
     
-    # Initialize recorders (3-LOSS: goal_cvae + diffusion + refiner)
+    # Initialize recorders (2-LOSS: diffusion + refiner)
     recorder = {}
     for agent_type in agent_type_lis:
         for length in length_lis:
@@ -444,17 +398,6 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
     recorder["loss"] = AverageMeter()
     recorder["diffusion_loss"] = AverageMeter()
     recorder["refiner_loss"] = AverageMeter()
-    recorder["goal_loss"] = AverageMeter()
-    recorder["goal_recon_loss"] = AverageMeter()
-    recorder["scorer_cls"] = AverageMeter()
-    recorder["scorer_err"] = AverageMeter()
-    recorder["hit1"] = AverageMeter()
-    recorder["meanrank"] = AverageMeter()
-
-    # Goal curriculum (only meaningful during training)
-    if is_train:
-        model_ref = model.module if hasattr(model, 'module') else model
-        model_ref.goal_curriculum_alpha = min(1.0, (epoch - 1) / max(1, args.goal_curriculum_epochs))
 
     start_time = time.time()
     if is_train:
@@ -518,8 +461,8 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_data_type):
                 if is_train:
-                    # Training: returns (total_loss, diffusion_loss, refiner_loss, goal_loss, goal_best_head_loss, type_masks, types)
-                    total_loss, diffusion_loss, refiner_loss, goal_loss, goal_recon_loss, pred_indice_bool_type_lis, agent_types = model(data)
+                    # Training: returns (total_loss, diffusion_loss, refiner_loss, type_masks, types)
+                    total_loss, diffusion_loss, refiner_loss, pred_indice_bool_type_lis, agent_types = model(data)
                     loss = total_loss
                 else:
                     # Inference: returns (trajectories, type_masks, types)
@@ -528,28 +471,23 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                     loss = torch.tensor(0.0, device=device)
                     diffusion_loss = torch.tensor(0.0, device=device)
                     refiner_loss = torch.tensor(0.0, device=device)
-                    goal_loss = torch.tensor(0.0, device=device)
-                    goal_recon_loss = torch.tensor(0.0, device=device)
 
             if is_train:
-                if not (torch.isnan(loss) or torch.isinf(loss)):
+                if not torch.isnan(loss):
                     if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                        clip_grads(model, 1.0, flag_on(args.clip_scorer_separately))
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
-                        clip_grads(model, 1.0, flag_on(args.clip_scorer_separately))
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
                     if scheduler is not None:
                         scheduler.step()
                 else:
-                    print(f"Bad loss at epoch {epoch}, batch {batch_index}: "
-                          f"total={loss.item():.4f}, diff={diffusion_loss.item():.4f}, "
-                          f"refiner={refiner_loss.item():.4f}, goal={goal_loss.item():.4f}, "
-                          f"goal_best={goal_recon_loss.item():.4f}")
+                    print(f"NaN loss at epoch {epoch}, batch {batch_index}")
                     optimizer.zero_grad()
                     continue
 
@@ -559,26 +497,12 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                     recorder["loss"].update(loss.item(), num_of_sample)
                     recorder["diffusion_loss"].update(diffusion_loss.item(), num_of_sample)
                     recorder["refiner_loss"].update(refiner_loss.item(), num_of_sample)
-                    recorder["goal_loss"].update(goal_loss.item(), num_of_sample)
-                    recorder["goal_recon_loss"].update(goal_recon_loss.item(), num_of_sample)
-
-                    # Scorer: stashed on the model rather than returned, so
-                    # forward()'s signature stays as train/test scripts expect.
-                    # Only set while training with the scorer enabled.
-                    if is_train:
-                        _m = model.module if hasattr(model, 'module') else model
-                        if getattr(_m, "last_scorer_cls", None) is not None:
-                            recorder["scorer_cls"].update(_m.last_scorer_cls.item(), num_of_sample)
-                            if getattr(_m, "last_scorer_err", None) is not None:    # ModeScorer only
-                                recorder["scorer_err"].update(_m.last_scorer_err.item(), num_of_sample)
 
                     if writer is not None and is_train:
                         current_step = global_step + batch_index
                         writer.add_scalar('Loss/total', loss.item(), current_step)
                         writer.add_scalar('Loss/diffusion', diffusion_loss.item(), current_step)
                         writer.add_scalar('Loss/refiner', refiner_loss.item(), current_step)
-                        writer.add_scalar('Loss/goal', goal_loss.item(), current_step)
-                        writer.add_scalar('Loss/goal_best_head', goal_recon_loss.item(), current_step)
                         writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], current_step)
 
                     # Validation metrics
@@ -603,22 +527,8 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                             now_labels = label_pos_lis[type_mask].cpu().numpy()
                             now_masks = label_mask_lis[type_mask].cpu().numpy()
                             
-                            # Chains are confidence-sorted by the model; index 0 = most-confident mode
                             best_pred = now_preds[:, 0, :, :]
-
-                            # Ranking quality at the full horizon. Chains arrive
-                            # already sorted, so a chain's rank IS its index and
-                            # the truly-best chain's index is its rank.
-                            if not is_train:
-                                ade_k = np.linalg.norm(
-                                    now_preds - now_labels[:, None], axis=-1).mean(-1)
-                                rank_of_best = ade_k.argmin(1)
-                                n_ag = ade_k.shape[0]
-                                recorder["hit1"].update(
-                                    float((rank_of_best == 0).mean()) * 100.0, n_ag)
-                                recorder["meanrank"].update(
-                                    float(rank_of_best.mean()), n_ag)
-
+                            
                             for length_idx, length in enumerate(length_lis):
                                 res, cnt = cal_ade_fde(
                                     best_pred[:, :length, :],
@@ -642,42 +552,23 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
 
                     # Print during training
                     if is_train and ((batch_index + 1) % print_freq) == 0:
-                        model_ref_log = model.module if hasattr(model, 'module') else model
                         print_text = f' Epoch: [{epoch}][{(batch_index+1)*batch_size*max(gpu_count,1)}/{num_sample}], '
                         print_text += f"Loss: {recorder['loss'].avg:.6f}, "
                         print_text += f"Diffusion: {recorder['diffusion_loss'].avg:.6f}, "
                         print_text += f"Refiner: {recorder['refiner_loss'].avg:.6f}, "
-                        print_text += f"Goal: {recorder['goal_loss'].avg:.6f}, "
-                        print_text += f"GoalBest: {recorder['goal_recon_loss'].avg:.6f}, "
-                        if recorder["scorer_cls"].count > 0:
-                            gated = model_ref_log.goal_curriculum_alpha >= 1.0
-                            if recorder["scorer_err"].count > 0:      # ModeScorer: CE / error regression
-                                scorer_text = (f"Scorer(ce/err): {recorder['scorer_cls'].avg:.3f}/"
-                                               f"{recorder['scorer_err'].avg:.3f}")
-                            else:                                       # TrajScorer: KL to the soft target
-                                scorer_text = f"Scorer(kl): {recorder['scorer_cls'].avg:.3f}"
-                            print_text += scorer_text + f"{'' if gated else ' [not applied yet]'}, "
-                        print_text += f"Curriculum: {model_ref_log.goal_curriculum_alpha:.3f}, "
                         print_text += f"Time: {time.time()-start_time:.2f}s, "
                         print_text += f"LR: {scheduler.get_last_lr()[0]:.2e}"
                         print(print_text, flush=True)
 
-                    # Validation: every val_every_train_step batches if > 0,
-                    # otherwise once at the end of the epoch. (Python quirk:
-                    # x % -1 == 0 for any x, so the old unguarded modulo made
-                    # this fire on every print step with the default -1.)
+                    # Validation: every val_every_train_step batches if > 0, otherwise once at the
+                    # end of the epoch. (x % -1 == 0 for any x, so the old unguarded modulo, nested
+                    # in the print step, validated every 100 batches and never at the epoch end.)
                     if is_train and ((val_every_train_step > 0 and (batch_index + 1) % val_every_train_step == 0) or (val_every_train_step <= 0 and batch_index == len(dataloader) - 1)) and not is_dev:
-
+                        
                         if writer is not None:
                             writer.add_scalar('Train_Epoch/loss', recorder["loss"].avg, epoch)
                             writer.add_scalar('Train_Epoch/diffusion_loss', recorder["diffusion_loss"].avg, epoch)
                             writer.add_scalar('Train_Epoch/refiner_loss', recorder["refiner_loss"].avg, epoch)
-                            writer.add_scalar('Train_Epoch/goal_loss', recorder["goal_loss"].avg, epoch)
-                            writer.add_scalar('Train_Epoch/goal_recon_loss', recorder["goal_recon_loss"].avg, epoch)
-                            if recorder["scorer_cls"].count > 0:
-                                writer.add_scalar('Train_Epoch/scorer_cls', recorder["scorer_cls"].avg, epoch)
-                                if recorder["scorer_err"].count > 0:
-                                    writer.add_scalar('Train_Epoch/scorer_err', recorder["scorer_err"].avg, epoch)
 
                         # Reset recorder
                         recorder = {}
@@ -688,12 +579,6 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                         recorder["loss"] = AverageMeter()
                         recorder["diffusion_loss"] = AverageMeter()
                         recorder["refiner_loss"] = AverageMeter()
-                        recorder["goal_loss"] = AverageMeter()
-                        recorder["goal_recon_loss"] = AverageMeter()
-                        recorder["scorer_cls"] = AverageMeter()
-                        recorder["scorer_err"] = AverageMeter()
-                        recorder["hit1"] = AverageMeter()
-                        recorder["meanrank"] = AverageMeter()
 
                         # Run validation
                         if gpu_count > 1:
@@ -747,28 +632,14 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
 
         model_ref = model.module if hasattr(model, 'module') else model
         refiner_status = "WITH REFINER" if getattr(model_ref, 'use_refiner', False) else "DIFFUSION ONLY"
-
+        
         print(f"\n{'='*80}")
         print(f"VALIDATION RESULTS - Epoch {epoch} [{refiner_status}]")
         print(f"{'='*80}")
         print(f"Loss: {recorder['loss'].avg:.6f}")
         print(f"  Diffusion Loss: {recorder['diffusion_loss'].avg:.6f}")
-        print(f"  Refiner Loss:   {recorder['refiner_loss'].avg:.6f}")
-        print(f"  Goal Loss (WTA+CE): {recorder['goal_loss'].avg:.6f}")
-        # goal_recon_loss is the per-coordinate mean of squared errors, so the
-        # Euclidean pixel RMSE is sqrt(2 * loss) * SCALE_FACTOR
-        print(f"  Best-Head Goal Error (RMSE={(2*recorder['goal_recon_loss'].avg)**0.5*50:.2f}px): {recorder['goal_recon_loss'].avg:.6f}")
+        print(f"  Refiner Loss: {recorder['refiner_loss'].avg:.6f}")
         print(f"{'-'*80}")
-        # Scorer ranking quality. K chains -> chance hit@1 = 100/K, chance
-        # meanRank = (K-1)/2. This is the number that says whether the scorer
-        # is doing anything; `ade` vs `min_ade` below is the same story in px.
-        if recorder["hit1"].count > 0:
-            n_modes = getattr(model_ref, 'num_samples', 20)
-            print(f"Scorer ranking:  hit@1 = {recorder['hit1'].avg:.1f}%  "
-                  f"(chance {100.0/n_modes:.1f}%)   "
-                  f"meanRank = {recorder['meanrank'].avg:.2f}  "
-                  f"(chance {(n_modes-1)/2:.1f})")
-            print(f"{'-'*80}")
         print(f"Averaged Metrics (pixels, scale={SCALE_FACTOR}):")
         for k, v in print_dic.items():
             print(f"  {k}: {v:.4f}")
@@ -781,17 +652,12 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
 
         if writer is not None:
             writer.add_scalar('Val/loss', recorder["loss"].avg, epoch)
-            if recorder["hit1"].count > 0:
-                writer.add_scalar('Val/scorer_hit1', recorder["hit1"].avg, epoch)
-                writer.add_scalar('Val/scorer_meanrank', recorder["meanrank"].avg, epoch)
             for metric_type in metric_type_lis:
                 writer.add_scalar(f'Val/{metric_type}_pixels', print_dic[metric_type], epoch)
             for agent_type in agent_type_lis:
                 for metric_type in metric_type_lis:
                     writer.add_scalar(f'Val/{agent_type}_{metric_type}', sub_print_dic[f"{agent_type}_{metric_type}"], epoch)
 
-        # Return every metric: the saver applies three different selection
-        # rules to them, so a single scalar is not enough.
         # Checkpoint selection numbers, the same in every version (see VAL_SEED)
         selection = full_horizon_sample_weighted(recorder, agent_type_lis, args.pred_len, metric_type_lis)
         print(f"Selection metrics, every val trajectory counted once at {args.pred_len * 0.4:.1f}s "
