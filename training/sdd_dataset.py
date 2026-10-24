@@ -1,25 +1,45 @@
 """
-SDD Dataset Loader for Diffusion Model - HDGT Style (Trajectory Prediction)
+SDD dataset loader: windows of tracks plus the scene's map elements, batched
+into one heterogeneous graph per window for the HDGT-style model.
 
-CORRECTED VERSION:
-- ALL velocities are PER-FRAME (pixels/frame = displacements)
-- Velocity convention: vel[t] = pos[t] - pos[t-1] (BACKWARD-LOOKING)
-- This ensures NO discontinuity between observation and prediction velocities
-- Coordinates are scaled down by SCALE_FACTOR for numerical stability
-- Agent distribution tracking and speed-normalized metrics
+Conventions
+- All velocities are PER-FRAME displacements, backward-looking:
+  vel[t] = pos[t] - pos[t-1], so observed and future velocities meet without a
+  discontinuity at the seam.
+- Coordinates are divided by SCALE_FACTOR for numerical stability; every metric
+  is reported back in original pixels.
+- Each agent's features and labels are expressed in its OWN frame: the origin
+  is its last observed position, the x axis its heading there.
 
-Expected Data Format:
-- Train: 52 pickle files in sdd/train/, 8 of them (VAL_VIDEOS) held out as validation
-- Test: 8 pickle files in sdd/test/, the final holdout
-- Shapes: sdd/shapes/<video>.pickle, drawn with draw_shapes.py; the obstacles find parked vehicles
-- Each pickle file contains a pandas DataFrame with columns:
-  ['trackId', 'frame', 'label', 'x', 'y', 'sceneId', 'metaId', 'xmin', 'ymin', 'xmax', 'ymax']
-- Trajectories are sampled at 2.5 FPS (every 12 frames at 30 FPS = 0.4 seconds)
-- Each metaId is one 20-timestep trajectory. One sample per distinct trajectory start frame,
-  whose targets are the trajectories starting there (the same windows as original_hdgt_on_sdd)
-- Neighbours as in HDGT (and original_hdgt_on_sdd): every other agent seen during the
-  observation, its observed steps without a sample filled (see fill_observation)
-- Parked cars/buses/carts (every position inside the drawn obstacles) are not agents (see PARKED_TYPES)
+Track data
+- sdd/train/<video>.pickle (52 videos, 8 of them held out as validation) and
+  sdd/test/<video>.pickle (8 videos, the final holdout).
+- Each is a pandas DataFrame with columns
+  ['trackId', 'frame', 'label', 'x', 'y', 'sceneId', 'metaId', 'xmin', 'ymin', 'xmax', 'ymax'].
+- Sampled at 2.5 FPS (every 12th frame of 30 FPS = 0.4 s), 8 observed steps
+  and 12 predicted ones.
+- Each metaId is one 20-timestep trajectory. One sample per distinct trajectory
+  start frame, whose targets are the trajectories starting there (the same
+  windows as original_hdgt_on_sdd), so every trajectory is predicted once.
+- Neighbours as in HDGT (and original_hdgt_on_sdd): every other agent seen
+  during the observation, its observed steps without a sample filled (see
+  fill_observation).
+
+Map elements (hand-annotated with draw_shapes.py):
+- sdd/shapes/<scene>_video<N>.pickle, one per video, same name as the track
+  pickle. One row per rectangle / circle, in raw image pixels; see
+  draw_shapes.py for the geometry convention.
+- Classes: grass (pedestrians may walk on it, nobody else may) and obstacle
+  (nobody may be inside it).
+- Every sample's graph gets its video's shapes as "map" nodes, with map->agent
+  and map->map edges. Map nodes are context only: nothing is predicted for them.
+- A car, bus or cart whose every position in the video is inside the drawn
+  obstacles is parked: that obstacle is how it is seen, and it is NOT an agent,
+  so nothing is predicted for it either (see PARKED_TYPES).
+- The collate fn also hands the model each target agent's forbidden shapes in
+  that agent's own frame, for the optional map penalties on goals and
+  trajectories (all off by default: the map reaches the model through the
+  graph only).
 """
 
 import os
@@ -39,16 +59,6 @@ import dgl
 # Metrics are reported in original pixel coordinates (scaled back up).
 # =============================================================================
 SCALE_FACTOR = 50.0
-
-# Agent type name mapping
-AGENT_TYPE_NAMES = {
-    1: "Pedestrian",
-    2: "Biker",
-    3: "Car",
-    4: "Bus",
-    5: "Cart",
-    6: "Skater"
-}
 
 # =============================================================================
 # TRAIN / VAL SPLIT
@@ -105,58 +115,267 @@ def resolve_split_files(data_folder, split):
     return tr if split == "train" else va
 
 
-# =============================================================================
-# PARKED VEHICLES -- the same rule in every version (keep them in sync)
-# A car, bus or cart is parked when EVERY position of its trackId in the video
-# lies inside the obstacle shapes drawn on the scene image (sdd/shapes,
-# draw_shapes.py). It is an obstacle, not an agent: neither predicted nor
-# anyone's neighbour, so it is in no metric. A vehicle outside the obstacles at
-# even one position is an agent, so a moving one whose annotation strays into an
-# obstacle (a camera jump, a misplaced box) is still predicted. A parked car
-# split over several trackIds is caught track by track. This loader has no map,
-# so a parked vehicle's rows are simply left out of the video.
-# =============================================================================
-PARKED_TYPES = (3, 4, 5)   # Car, Bus, Cart
+# Agent type name mapping
+AGENT_TYPE_NAMES = {
+    1: "Pedestrian",
+    2: "Biker",
+    3: "Car",
+    4: "Bus",
+    5: "Cart",
+    6: "Skater"
+}
+PEDESTRIAN_TYPE = 1
 
 
-def load_obstacle_shapes(shapes_folder, scene_id, scale_factor=SCALE_FACTOR):
-    """Obstacle shapes of one video as (S, 6) rows [cx, cy, half_w, half_h, theta, is_circle], SCALED"""
-    path = os.path.join(shapes_folder, scene_id + '.pickle')
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"No shapes for {scene_id}: expected {path}. Parked vehicles are found with the "
-            f"obstacle shapes drawn by draw_shapes.py.")
-    shapes = pd.read_pickle(path)
-    shapes = shapes[shapes['label'] == 'obstacle']
-    is_circle = (shapes['shape'].values == 'circle')
-    radius = shapes['radius'].values.astype(np.float64)
-    half_w = np.where(is_circle, radius, shapes['half_w'].values.astype(np.float64))
-    half_h = np.where(is_circle, radius, shapes['half_h'].values.astype(np.float64))
-    theta = np.where(is_circle, 0.0, shapes['theta'].values.astype(np.float64))
-    return np.stack([shapes['cx'].values / scale_factor, shapes['cy'].values / scale_factor,
-                     half_w / scale_factor, half_h / scale_factor, theta,
-                     is_circle.astype(np.float64)], axis=-1).reshape(-1, 6)
+# =============================================================================
+# MAP ELEMENTS
+#
+# Map node class (m_n_type) and what each class forbids:
+#   0 grass     forbidden for every agent type except Pedestrian
+#   1 obstacle  forbidden for every agent type
+# Undrawn space is free for everyone.
+#
+# World-frame geometry of a scene, one row per shape, SCALED units:
+#   [cx, cy, half_w, half_h, theta, is_circle]
+# A circle's radius is its half_w (== half_h) and its theta is 0. Rectangles
+# are stored with the long side on their own x axis (half_w >= half_h), which
+# makes (size, theta mod pi) a unique description of each rectangle, so the
+# orientation features below never see two encodings of one shape.
+# =============================================================================
+# Parked vehicles. A car, bus or cart the user drew obstacles on -- EVERY
+# position of its trackId in the video lies inside the drawn obstacle shapes --
+# is scene furniture, not traffic: that drawn obstacle is its map node, it is
+# not an agent node, and nothing is predicted for it, so it also leaves the
+# metrics. How much it moves does not matter (SDD's box around a parked car
+# shifts 1-4 px between frames), but a vehicle outside the obstacles at even one
+# position is an agent, so a moving one whose annotation strays into an
+# obstacle (a camera jump, a misplaced box) is still predicted. Other agent
+# types are never treated this way. The same rule in every version (keep them
+# in sync with parked_track_ids in the others).
+PARKED_TYPES = (3, 4, 5)        # Car, Bus, Cart
+
+MAP_CLASS_NAMES = {0: "Grass", 1: "Obstacle"}
+MAP_LABEL_TO_CLASS = {"grass": 0, "obstacle": 1}
+MAP_GRASS, MAP_OBSTACLE = 0, 1
+NUM_MAP_TYPES = 2
+G_CX, G_CY, G_HW, G_HH, G_TH, G_CIRC = range(6)
+
+# Map -> agent edges. An agent is linked to every shape whose NEAREST POINT
+# (not its centre: a 350 px wall is relevant long before its centre is) lies
+# within  base range for its type + the distance it covers over the prediction
+# horizon at its current speed. From the train split, 4.8 s travel at p90 is
+# ~200 px for pedestrians, ~500 px for bikers, ~420 px for skaters and ~350 px
+# for carts; the speed term tracks that per agent, and the base covers turning
+# and speeding up. Shapes the agent stands inside have distance < 0 and are
+# always linked. SCALED units (x50 = pixels).
+#
+# Every base but the pedestrian's was raised by 50 px together with a widening of
+# map_size_lis. map_size_lis has since been reverted to hdgt_goal's ranges; these
+# map -> agent ranges were left as they are.
+MAP_EDGE_BASE_RANGE = {
+    1: 2.0,   # Pedestrian: 100 px (unchanged)
+    2: 4.0,   # Biker:      200 px (was 150)
+    3: 4.0,   # Car:        200 px (was 150)
+    4: 5.0,   # Bus:        250 px (was 200)
+    5: 4.0,   # Cart:       200 px (was 150)
+    6: 4.0,   # Skater:     200 px (was 150)
+}
+MAX_MAP_EDGE_PER_AGENT = 32
+# Map -> map edges join shapes whose gap is at most 25 px, so the pieces of one
+# composite region (a building drawn as three rectangles, a lawn drawn as
+# several circles) and tightly packed neighbours can exchange context.
+M2M_GAP_THRESHOLD = 0.5
+MAX_M2M_EDGE_PER_NODE = 16
+# Boundary sampling step for the map->map gap, SCALED (2 px).
+_BOUNDARY_STEP = 0.04
+
+# Feature widths, mirrored in model_goal_multigoal.py.
+MAP_NODE_FEA_DIM = 3    # [w, h, is_circle], own frame, SCALED
+M2A_EDGE_FEA_DIM = 7    # see build_map_agent_edges
+M2M_EDGE_FEA_DIM = 5    # see build_map_map_edges
+MAP_LOSS_GEOM_DIM = 7   # [cx, cy, half_w, half_h, cos, sin, is_circle], agent frame
+
+
+def _wrap_half_pi(theta):
+    """Wrap to [-pi/2, pi/2): a rectangle turned half a circle is unchanged."""
+    return (theta + np.pi / 2.0) % np.pi - np.pi / 2.0
+
+
+def _canonicalise_rect(half_w, half_h, theta):
+    """Put the long side on the rectangle's own x axis.
+
+    Turning a rectangle a quarter turn and swapping its sides is the same
+    rectangle, so containment is unchanged, and (size, theta) then describes
+    each rectangle exactly once -- the orientation features never see two
+    encodings of one shape.
+    """
+    swap = half_h > half_w
+    return (np.where(swap, half_h, half_w), np.where(swap, half_w, half_h),
+            _wrap_half_pi(np.where(swap, theta + np.pi / 2.0, theta)))
 
 
 def shape_sdf_np(points, geom):
-    """Signed distance from points (..., 2) to shapes (S, 6), negative inside -> (..., S)"""
+    """Signed distance from points to shapes, negative inside.
+
+    points (..., 2) and geom (S, 6) in the same frame -> (..., S). A point is
+    inside exactly when draw_shapes.contains() says so: sd <= 0 iff
+    |u| <= half_w and |v| <= half_h (rectangle) or |p - c| <= r (circle).
+    """
     p = np.asarray(points, dtype=np.float64)[..., np.newaxis, :]
-    dx = p[..., 0] - geom[:, 0]
-    dy = p[..., 1] - geom[:, 1]
-    c, s = np.cos(geom[:, 4]), np.sin(geom[:, 4])
+    dx = p[..., 0] - geom[:, G_CX]
+    dy = p[..., 1] - geom[:, G_CY]
+    c, s = np.cos(geom[:, G_TH]), np.sin(geom[:, G_TH])
     u = dx * c + dy * s
     v = -dx * s + dy * c
-    qx = np.abs(u) - geom[:, 2]
-    qy = np.abs(v) - geom[:, 3]
+    qx = np.abs(u) - geom[:, G_HW]
+    qy = np.abs(v) - geom[:, G_HH]
     sd_rect = (np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0))
                + np.minimum(np.maximum(qx, qy), 0.0))
-    sd_circle = np.hypot(dx, dy) - geom[:, 2]
-    return np.where(geom[:, 5] > 0.5, sd_circle, sd_rect)
+    sd_circ = np.hypot(dx, dy) - geom[:, G_HW]
+    return np.where(geom[:, G_CIRC] > 0.5, sd_circ, sd_rect)
 
 
-def parked_track_ids(df, type_map, obstacles, scale_factor=SCALE_FACTOR):
-    """trackIds of one video's parked vehicles: the Car, Bus and Cart tracks whose every row
-    lies inside one of the obstacle shapes (S, 6), SCALED"""
+def shape_nearest_boundary_np(points, geom):
+    """Nearest point ON THE BOUNDARY of each shape, (P, 2) x (S, 6) -> (P, S, 2).
+
+    From outside that is the nearest point of the shape; from inside it is the
+    nearest way out.
+    """
+    p = np.asarray(points, dtype=np.float64)[:, np.newaxis, :]
+    dx = p[..., 0] - geom[:, G_CX]
+    dy = p[..., 1] - geom[:, G_CY]
+    c, s = np.cos(geom[:, G_TH]), np.sin(geom[:, G_TH])
+    hw, hh = geom[:, G_HW], geom[:, G_HH]
+    u = dx * c + dy * s
+    v = -dx * s + dy * c
+    inside = (np.abs(u) <= hw) & (np.abs(v) <= hh)
+    su = np.where(u >= 0, 1.0, -1.0)
+    sv = np.where(v >= 0, 1.0, -1.0)
+    exit_u = (hw - np.abs(u)) <= (hh - np.abs(v))
+    bu = np.where(inside, np.where(exit_u, su * hw, u), np.clip(u, -hw, hw))
+    bv = np.where(inside, np.where(exit_u, v, sv * hh), np.clip(v, -hh, hh))
+    rect = np.stack([geom[:, G_CX] + bu * c - bv * s,
+                     geom[:, G_CY] + bu * s + bv * c], axis=-1)
+    n = np.hypot(dx, dy)
+    safe = np.where(n > 1e-9, n, 1.0)
+    ux = np.where(n > 1e-9, dx / safe, 1.0)
+    uy = np.where(n > 1e-9, dy / safe, 0.0)
+    circ = np.stack([geom[:, G_CX] + hw * ux, geom[:, G_CY] + hw * uy], axis=-1)
+    return np.where((geom[:, G_CIRC] > 0.5)[:, np.newaxis], circ, rect)
+
+
+def _boundary_samples(g, step=_BOUNDARY_STEP):
+    """Points along one shape's outline, at most `step` apart, corners included."""
+    if g[G_CIRC] > 0.5:
+        n = max(16, int(np.ceil(2.0 * np.pi * g[G_HW] / step)))
+        a = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        return np.stack([g[G_CX] + g[G_HW] * np.cos(a),
+                         g[G_CY] + g[G_HW] * np.sin(a)], axis=-1)
+    hw, hh = g[G_HW], g[G_HH]
+    corners = np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh], [-hw, -hh]])
+    pts = []
+    for a, b in zip(corners[:-1], corners[1:]):
+        n = max(2, int(np.ceil(np.linalg.norm(b - a) / step)) + 1)
+        pts.append(a + np.linspace(0.0, 1.0, n)[:, np.newaxis] * (b - a))
+    loc = np.concatenate(pts, axis=0)
+    c, s = np.cos(g[G_TH]), np.sin(g[G_TH])
+    return np.stack([g[G_CX] + loc[:, 0] * c - loc[:, 1] * s,
+                     g[G_CY] + loc[:, 0] * s + loc[:, 1] * c], axis=-1)
+
+
+def _orientation_feature(theta_rel, is_circle):
+    """(cos 2d, sin 2d) of a rectangle's relative angle d: continuous across the
+    theta wrap and blind to a half turn, which leaves a rectangle unchanged.
+    A circle has no orientation and gets (0, 0)."""
+    return np.where(is_circle, 0.0, np.cos(2.0 * theta_rel)), \
+           np.where(is_circle, 0.0, np.sin(2.0 * theta_rel))
+
+
+_EMPTY_M2M = (np.zeros(0, np.int64), np.zeros(0, np.int64),
+              np.zeros((0, M2M_EDGE_FEA_DIM), np.float32))
+
+
+def _m2m_features(geom, src, dst, gap):
+    """Edge features in the DESTINATION shape's own frame (centre, theta):
+        [rel_cx, rel_cy, gap, cos 2(th_src - th_dst), sin 2(...)]
+    the orientation pair is (0, 0) when either end is a circle."""
+    d = geom[src, :2] - geom[dst, :2]
+    c, s = np.cos(-geom[dst, G_TH]), np.sin(-geom[dst, G_TH])
+    either_circle = (geom[src, G_CIRC] > 0.5) | (geom[dst, G_CIRC] > 0.5)
+    ocos, osin = _orientation_feature(geom[src, G_TH] - geom[dst, G_TH], either_circle)
+    fea = np.stack([d[:, 0] * c - d[:, 1] * s,
+                    d[:, 1] * c + d[:, 0] * s,
+                    gap[src, dst], ocos, osin], axis=-1)
+    return fea.astype(np.float32)
+
+
+def _m2m_edges_from_gap(geom, gap, keep=None):
+    """Edges under M2M_GAP_THRESHOLD, nearest first, capped per destination.
+    keep(src, dst) -> bool filters candidate pairs."""
+    src, dst = [], []
+    for j in range(geom.shape[0]):
+        near = np.where(gap[:, j] <= M2M_GAP_THRESHOLD)[0]
+        if keep is not None and len(near):
+            near = near[keep(near, j)]
+        if len(near) > MAX_M2M_EDGE_PER_NODE:
+            near = near[np.argsort(gap[near, j], kind="stable")][:MAX_M2M_EDGE_PER_NODE]
+        src += near.tolist()
+        dst += [j] * len(near)
+    if not src:
+        return _EMPTY_M2M
+    src, dst = np.array(src, np.int64), np.array(dst, np.int64)
+    return src, dst, _m2m_features(geom, src, dst, gap)
+
+
+def build_map_map_edges(geom):
+    """Map -> map edges between shapes at most M2M_GAP_THRESHOLD apart.
+
+    The gap is the distance between the two outlines, 0 when the shapes touch,
+    overlap or one contains the other. Measured on outline samples, so it is
+    exact at corners and within ~1 px elsewhere.
+    Returns (src, dst, fea) with fea (E, M2M_EDGE_FEA_DIM).
+    """
+    S = geom.shape[0]
+    if S < 2:
+        return _EMPTY_M2M
+    gap = np.empty((S, S))
+    for i in range(S):
+        gap[i] = shape_sdf_np(_boundary_samples(geom[i]), geom).min(axis=0)
+    gap = np.maximum(np.minimum(gap, gap.T), 0.0)
+    np.fill_diagonal(gap, np.inf)
+    return _m2m_edges_from_gap(geom, gap)
+
+
+def _m2m_edges_touching_new(geom, n_static):
+    """Map -> map edges where at least one end is a shape at index >= n_static.
+
+    For the parked vehicles added to a window: the static shapes' own edges are
+    already known, so only the pairs involving a new shape are computed.
+    """
+    S = geom.shape[0]
+    if S < 2 or n_static >= S:
+        return _EMPTY_M2M
+    gap = np.full((S, S), np.inf)
+    for i in range(n_static, S):
+        g_i = shape_sdf_np(_boundary_samples(geom[i]), geom).min(axis=0)
+        # A shape swallowed whole by i has no boundary point inside i, so its
+        # outline distance misses the overlap; its centre inside i catches it.
+        swallowed = shape_sdf_np(geom[:, :2], geom[i:i + 1]).ravel() < 0
+        g_i = np.maximum(np.where(swallowed, 0.0, g_i), 0.0)
+        gap[i] = np.minimum(gap[i], g_i)
+        gap[:, i] = np.minimum(gap[:, i], g_i)      # the gap is symmetric
+    np.fill_diagonal(gap, np.inf)
+    return _m2m_edges_from_gap(
+        geom, gap, keep=lambda near, j: (near >= n_static) | (j >= n_static))
+
+
+def parked_track_ids(df, type_map, scene_map, scale_factor=SCALE_FACTOR):
+    """trackIds of one video's parked vehicles: the Car, Bus and Cart tracks whose
+    every row lies inside one of the video's hand-drawn OBSTACLE shapes. A
+    vehicle driving past a building leaves the shape, and one waiting at a light
+    is not inside a drawn shape at all.
+    """
+    obstacles = scene_map["geom"][scene_map["cls"] == MAP_OBSTACLE]
     vehicles = df[df['label'].map(type_map).isin(PARKED_TYPES)]
     if obstacles.shape[0] == 0 or len(vehicles) == 0:
         return set()
@@ -200,6 +419,152 @@ def fill_observation(frames, positions, obs_frames):
     return filled, mask
 
 
+def scene_map_with_parked(scene_map, parked_geom):
+    """The video's shapes plus this window's parked vehicles, as obstacles.
+
+    "is_parked" marks which rows came from a vehicle rather than from
+    draw_shapes.py — for reporting and for drawing them, not for the model.
+    """
+    if len(parked_geom) == 0:
+        return scene_map
+    parked_geom = np.asarray(parked_geom, dtype=np.float64).reshape(-1, 6)
+    n_static = scene_map["geom"].shape[0]
+    n_parked = parked_geom.shape[0]
+    geom = np.concatenate([scene_map["geom"], parked_geom], axis=0)
+    src, dst, fea = _m2m_edges_touching_new(geom, n_static)
+    return {
+        "scene_id": scene_map["scene_id"],
+        "geom": geom,
+        "cls": np.concatenate([scene_map["cls"],
+                               np.full(n_parked, MAP_OBSTACLE, np.int64)]),
+        "shape_id": np.concatenate([scene_map["shape_id"],
+                                    -1 - np.arange(n_parked, dtype=np.int64)]),
+        "node_fea": np.concatenate([
+            scene_map["node_fea"],
+            np.stack([2.0 * parked_geom[:, G_HW], 2.0 * parked_geom[:, G_HH],
+                      parked_geom[:, G_CIRC]], axis=-1).astype(np.float32)]),
+        "m2m_src": np.concatenate([scene_map["m2m_src"], src]),
+        "m2m_dst": np.concatenate([scene_map["m2m_dst"], dst]),
+        "m2m_fea": np.concatenate([scene_map["m2m_fea"], fea]),
+        "is_parked": np.concatenate([scene_map["is_parked"],
+                                     np.ones(n_parked, dtype=bool)]),
+    }
+
+
+def build_map_agent_edges(agent_pos, agent_psi, agent_range, geom):
+    """Map -> agent edges: shape s -> agent a when sd(a, s) <= agent_range[a].
+
+    agent_pos (N, 2) and agent_psi (N,) are each agent's last observed position
+    and heading, the same reference its node features are normalised to.
+    Edge features, in the agent's frame:
+        [rel_cx, rel_cy, near_x, near_y, sd, cos 2(th - psi), sin 2(th - psi)]
+    rel_c is the shape centre, near the nearest point on its outline, sd the
+    signed distance (negative when the agent is inside); the orientation pair
+    is (0, 0) for circles. Capped at MAX_MAP_EDGE_PER_AGENT, nearest first.
+    Returns (src_map, dst_agent, fea).
+    """
+    N, S = agent_pos.shape[0], geom.shape[0]
+    if S == 0 or N == 0:
+        return (np.zeros(0, np.int64), np.zeros(0, np.int64),
+                np.zeros((0, M2A_EDGE_FEA_DIM), np.float32))
+    sd = shape_sdf_np(agent_pos, geom)                       # (N, S)
+    src, dst = [], []
+    for a in range(N):
+        near = np.where(sd[a] <= agent_range[a])[0]
+        if len(near) > MAX_MAP_EDGE_PER_AGENT:
+            near = near[np.argsort(sd[a, near], kind="stable")][:MAX_MAP_EDGE_PER_AGENT]
+        src += near.tolist()
+        dst += [a] * len(near)
+    if not src:
+        return (np.zeros(0, np.int64), np.zeros(0, np.int64),
+                np.zeros((0, M2A_EDGE_FEA_DIM), np.float32))
+    src, dst = np.array(src, np.int64), np.array(dst, np.int64)
+
+    nearest = shape_nearest_boundary_np(agent_pos, geom)[dst, src]   # (E, 2)
+    c, s = np.cos(-agent_psi[dst]), np.sin(-agent_psi[dst])
+    rc = geom[src, :2] - agent_pos[dst]
+    rn = nearest - agent_pos[dst]
+    ocos, osin = _orientation_feature(geom[src, G_TH] - agent_psi[dst],
+                                      geom[src, G_CIRC] > 0.5)
+    fea = np.stack([rc[:, 0] * c - rc[:, 1] * s, rc[:, 1] * c + rc[:, 0] * s,
+                    rn[:, 0] * c - rn[:, 1] * s, rn[:, 1] * c + rn[:, 0] * s,
+                    sd[dst, src], ocos, osin], axis=-1)
+    return src, dst, fea.astype(np.float32)
+
+
+def densify_path_np(pos, start):
+    """(A, T, 2) positions + (A, 2) start -> (A, 2T, 2): each segment's midpoint
+    followed by its end point, so a path cannot step over a thin wall between
+    two samples. Same point set as model_goal_multigoal.densify_path."""
+    prev = np.concatenate([start[:, np.newaxis, :], pos[:, :-1, :]], axis=1)
+    mid = 0.5 * (prev + pos)
+    return np.stack([mid, pos], axis=2).reshape(pos.shape[0], 2 * pos.shape[1], 2)
+
+
+def forbidden_shapes(map_cls, agent_types):
+    """(A, S) bool: obstacles for everyone, grass for everyone but pedestrians."""
+    obstacle = (map_cls == MAP_OBSTACLE)[np.newaxis, :]
+    grass = (map_cls == MAP_GRASS)[np.newaxis, :]
+    wheeled = (np.asarray(agent_types) != PEDESTRIAN_TYPE)[:, np.newaxis]
+    return obstacle | (grass & wheeled)
+
+
+def load_scene_map(shapes_folder, scene_id, scale_factor=SCALE_FACTOR):
+    """Load <shapes_folder>/<scene_id>.pickle into the arrays the loader uses.
+
+    Refuses a file whose rows name a different video, an unknown class or shape
+    kind, or a non-finite value, so a misplaced or stale file fails loudly
+    instead of silently pairing one video's tracks with another's map.
+    """
+    path = os.path.join(shapes_folder, scene_id + ".pickle")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No map for {scene_id}: expected {path}. Every track pickle needs a "
+            f"shapes pickle of the same name (draw_shapes.py writes them).")
+    df = pd.read_pickle(path)
+
+    if len(df) and set(df["sceneId"].unique()) != {scene_id}:
+        raise ValueError(f"{path} holds shapes of {sorted(df['sceneId'].unique())}, "
+                         f"not {scene_id}")
+    bad_label = set(df["label"].unique()) - set(MAP_LABEL_TO_CLASS)
+    if bad_label:
+        raise ValueError(f"{path}: unknown map classes {sorted(bad_label)}")
+    bad_shape = set(df["shape"].unique()) - {"rectangle", "circle"}
+    if bad_shape:
+        raise ValueError(f"{path}: unknown shape kinds {sorted(bad_shape)}")
+
+    is_circ = (df["shape"].values == "circle")
+    radius = df["radius"].values.astype(np.float64)
+    hw = np.where(is_circ, radius, df["half_w"].values.astype(np.float64))
+    hh = np.where(is_circ, radius, df["half_h"].values.astype(np.float64))
+    th = np.where(is_circ, 0.0, df["theta"].values.astype(np.float64))
+    hw_c, hh_c, th_c = _canonicalise_rect(hw, hh, th)
+    hw = np.where(is_circ, hw, hw_c)      # a circle has no long side
+    hh = np.where(is_circ, hh, hh_c)
+    th = np.where(is_circ, 0.0, th_c)
+
+    geom = np.stack([df["cx"].values / scale_factor, df["cy"].values / scale_factor,
+                     hw / scale_factor, hh / scale_factor, th,
+                     is_circ.astype(np.float64)], axis=-1).reshape(-1, 6)
+    if not np.all(np.isfinite(geom)) or np.any(geom[:, G_HW] <= 0) or np.any(geom[:, G_HH] <= 0):
+        raise ValueError(f"{path}: non-finite or non-positive shape geometry")
+
+    cls = np.array([MAP_LABEL_TO_CLASS[l] for l in df["label"].values], dtype=np.int64)
+    m2m_src, m2m_dst, m2m_fea = build_map_map_edges(geom)
+    return {
+        "scene_id": scene_id,
+        "geom": geom,                                   # (S, 6) world, SCALED
+        "cls": cls,                                     # (S,) 0 grass / 1 obstacle
+        "shape_id": df["shapeId"].values.astype(np.int64),
+        "node_fea": np.stack([2.0 * geom[:, G_HW], 2.0 * geom[:, G_HH],
+                              geom[:, G_CIRC]], axis=-1).astype(np.float32),
+        "m2m_src": m2m_src, "m2m_dst": m2m_dst, "m2m_fea": m2m_fea,
+        # All drawn here; scene_map_with_parked() appends this window's parked
+        # vehicles with is_parked True.
+        "is_parked": np.zeros(len(cls), dtype=bool),
+    }
+
+
 class SDDDataset(Dataset):
     def __init__(self, pickle_files, obs_len=8, pred_len=12, shapes_folder=None):
         """
@@ -207,10 +572,11 @@ class SDDDataset(Dataset):
             pickle_files: List of pickle file paths
             obs_len: Number of observation frames (default 8)
             pred_len: Number of prediction frames (default 12)
-            shapes_folder: Folder of the per-video shape pickles, used to find parked vehicles.
-                Default: "shapes" next to the folder holding each track pickle (../sdd/shapes)
+            shapes_folder: folder of per-video map pickles. Default: "shapes"
+                next to the folder holding each track pickle (../sdd/shapes).
         """
         self.shapes_folder = shapes_folder
+        self.scene_maps = {}
         self.parked_count = 0  # parked Car/Bus/Cart trajectories, not agents
         self.obs_len = obs_len
         self.pred_len = pred_len
@@ -247,12 +613,17 @@ class SDDDataset(Dataset):
         for pkl_idx, pkl_file in enumerate(pickle_files):
             df = pd.read_pickle(pkl_file)
             scene_id = os.path.basename(pkl_file).replace('.pickle', '')
+            # The map is looked up by the track pickle's own video name, so a
+            # video can only ever be paired with the shapes drawn on it.
             shapes_folder = self.shapes_folder or os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(pkl_file))), 'shapes')
-            obstacles = load_obstacle_shapes(shapes_folder, scene_id, self.scale_factor)
+                os.path.dirname(os.path.dirname(os.path.abspath(pkl_file))), "shapes")
+            scene_map = load_scene_map(shapes_folder, scene_id, self.scale_factor)
+            self.scene_maps[scene_id] = scene_map
+            n_before = len(self.samples)
 
-            # Parked vehicles are obstacles, not agents: their rows go before any window is cut
-            parked = df['trackId'].isin(parked_track_ids(df, self.type_map, obstacles, self.scale_factor))
+            # Parked vehicles are obstacles (the shapes drawn on them), not agents:
+            # their rows go before any window is cut
+            parked = df['trackId'].isin(parked_track_ids(df, self.type_map, scene_map, self.scale_factor))
             self.parked_count += df.loc[parked, 'metaId'].nunique()
             df = df[~parked]
             tracks = self._tracks_of_scene(df)
@@ -262,10 +633,12 @@ class SDDDataset(Dataset):
             row_frames = df['frame'].values[order]
             row_track_ids = df['trackId'].values[order]
 
-            # Windows as in original_hdgt_on_sdd: each metaId is one 20-timestep trajectory,
-            # sampled every 12 frames from its own first frame. One sample per distinct
-            # trajectory start frame; its window is start + 12*k, and the trajectories that
-            # start there are its targets, so every trajectory is predicted exactly once.
+            # Windows as in original_hdgt_on_sdd: each metaId is one 20-timestep
+            # trajectory, sampled every 12 frames from its own first frame. One
+            # sample per distinct trajectory start frame; its window is
+            # start + 12*k, and the trajectories that start there are its targets,
+            # so every trajectory is predicted exactly once. Windows overlap, so
+            # split by video, never by window.
             trajectories = df.groupby('metaId').agg(start_frame=('frame', 'min'),
                                                     trackId=('trackId', 'first'))
             for start_frame, starting_here in trajectories.groupby('start_frame'):
@@ -278,17 +651,23 @@ class SDDDataset(Dataset):
                 seen_track_ids = np.unique(row_track_ids[first:last])
 
                 sample = self._build_multi_agent_sample(df, tracks, seen_track_ids, window_frames,
-                                                        obs_frames, scene_id,
+                                                        obs_frames, scene_id, scene_map,
                                                         set(starting_here['trackId']))
                 if sample is not None:
                     self.samples.append(sample)
 
-            print(f"  [{pkl_idx+1:2d}/{len(pickle_files)}] {scene_id:40s} -> {len(self.samples):6d} total samples")
+            n_obst = int((scene_map["cls"] == MAP_OBSTACLE).sum())
+            n_grass = int((scene_map["cls"] == MAP_GRASS).sum())
+            print(f"  [{pkl_idx+1:2d}/{len(pickle_files)}] {scene_id:28s} -> {len(self.samples):6d} total samples"
+                  f"  (+{len(self.samples) - n_before:4d}) | map: {n_obst:2d} obstacle, {n_grass:2d} grass,"
+                  f" {len(scene_map['m2m_src']):3d} map-map edges")
 
         print(f"\n{'='*80}")
         print(f"Dataset loading complete: {len(self.samples)} total samples")
-        print(f"Parked cars/buses/carts (every position inside the drawn obstacles, not agents): "
-              f"{self.parked_count} trajectories")
+        print(f"Parked cars/buses/carts: {self.parked_count} trajectories, every position of their "
+              f"tracks inside the\nobstacles drawn in sdd/shapes. That obstacle is their map node; "
+              f"they are NOT agents and NOTHING\nis predicted for them, so they are absent "
+              f"from the counts below and from every metric.")
         self._print_agent_distribution()
         print(f"{'='*80}\n")
 
@@ -348,7 +727,7 @@ class SDDDataset(Dataset):
         return velocities
 
     def _build_multi_agent_sample(self, df, tracks, seen_track_ids, window_frames, obs_frames,
-                                  scene_id, starting_track_ids):
+                                  scene_id, scene_map, starting_track_ids):
         """
         Build a multi-agent sample for one window: the trajectories starting on its first
         frame (starting_track_ids) are the targets, and every other agent seen during the
@@ -368,6 +747,10 @@ class SDDDataset(Dataset):
         target_track_ids = []
         context_agents = []
         context_types = []
+        # Always empty: a parked vehicle is an obstacle through the shape the user
+        # drew on it, so no rectangle is generated here. Kept so
+        # scene_map_with_parked stays a no-op rather than a second code path.
+        parked_geoms = []
 
         for track_id in seen_track_ids:
             agent_data = (window_agents[window_agents['trackId'] == track_id]
@@ -477,6 +860,9 @@ class SDDDataset(Dataset):
         sample = {
             'agent_feature': agent_features,
             'agent_type': agent_types,
+            # The video's shapes plus this window's parked vehicles. Without any
+            # parked vehicle this is the shared map itself, not a copy.
+            'scene_map': scene_map_with_parked(scene_map, parked_geoms),
             'pred_num': pred_num,
             'label_pos': labels_pos,      # Position labels for evaluation (SCALED)
             'label_vel': labels_vel,      # Velocity labels for diffusion (SCALED, per-frame)
@@ -644,8 +1030,14 @@ def euclid_np(label, pred):
     return np.sqrt((label[..., 0] - pred[..., 0])**2 + (label[..., 1] - pred[..., 1])**2)
 
 
-def generate_heterogeneous_graph(agent_fea, agent_map_size_lis):
-    """Build agent-only heterogeneous graph with proximity-based edges"""
+def generate_heterogeneous_graph(agent_fea, agent_map_size_lis, agent_type=None,
+                                 scene_map=None, pred_len=12):
+    """Build the heterogeneous graph with proximity-based edges.
+
+    Always: agent self-loops and agent -> agent ("other") edges.
+    With scene_map: map -> agent ("m2a") and map -> map ("m2m") edges too, plus
+    their features, returned under "m2a_fea" / "m2m_fea".
+    """
     max_in_edge_per_type = 32
     uv_dic = {}
 
@@ -685,10 +1077,75 @@ def generate_heterogeneous_graph(agent_fea, agent_map_size_lis):
             uv_dic[("agent", "other", "agent")][0] += [agent_index_i] * len(nearby_agent_index)
             uv_dic[("agent", "other", "agent")][1] += nearby_agent_index
 
+    out = {}
+    if scene_map is not None:
+        # Map -> agent: range grows with the distance the agent covers over the
+        # prediction horizon at its current (per-frame) speed.
+        speed = np.hypot(agent_fea[:, -1, 2], agent_fea[:, -1, 3])
+        base = np.array([MAP_EDGE_BASE_RANGE[int(t)] for t in agent_type], dtype=np.float64)
+        m2a_src, m2a_dst, m2a_fea = build_map_agent_edges(
+            agent_fea[:, -1, :2], agent_fea[:, -1, 4], base + pred_len * speed,
+            scene_map["geom"])
+        uv_dic[("map", "m2a", "agent")] = [m2a_src.tolist(), m2a_dst.tolist()]
+        # Map -> map: static per video, precomputed at load time.
+        uv_dic[("map", "m2m", "map")] = [scene_map["m2m_src"].tolist(),
+                                         scene_map["m2m_dst"].tolist()]
+        out["m2a_fea"] = m2a_fea
+        out["m2m_fea"] = scene_map["m2m_fea"]
+
     for key in uv_dic:
         uv_dic[key] = (torch.LongTensor(uv_dic[key][0]), torch.LongTensor(uv_dic[key][1]))
 
-    return {"uv_dic": uv_dic}
+    out["uv_dic"] = uv_dic
+    return out
+
+
+def build_map_loss_geometry(scene_map, target_types, ref_coor, ref_psi, gt_pos,
+                            margin=0.0):
+    """Per target agent: every shape of its video in the AGENT'S frame, plus
+    which of them its goals and trajectories are penalised for entering.
+
+    Args:
+        target_types (A,), ref_coor (A, 2), ref_psi (A,): each target's type and
+            the frame its labels and predictions live in (last observed
+            position and heading, world SCALED).
+        gt_pos (A, T, 2): GT future, world SCALED.
+        margin: penalty margin, SCALED; must match the model's map_margin.
+    Returns:
+        geom   (A, S, MAP_LOSS_GEOM_DIM)  [cx, cy, half_w, half_h, cos, sin, is_circle]
+        forbid (A, S) bool  the shape is off limits for this agent's type
+        loss   (A, S) bool  forbid, minus shapes this agent's own GT path enters
+
+    Why "loss" drops shapes the GT enters: parked cars sit inside the parking
+    areas drawn as obstacles (in nexus_video11, 99.8% of stationary car points
+    are inside an obstacle), and some paths clip an outline by a pixel or two.
+    Penalising a prediction for going where the GT itself goes would fight the
+    regression losses, so those shapes are exempt for that one agent. The test
+    is run on exactly the point set the model penalises (densified path, same
+    margin), which guarantees the GT itself has zero map penalty.
+    """
+    geom_w, cls = scene_map["geom"], scene_map["cls"]
+    A, S = len(target_types), geom_w.shape[0]
+    if S == 0:
+        return (np.zeros((A, 0, MAP_LOSS_GEOM_DIM), np.float32),
+                np.zeros((A, 0), bool), np.zeros((A, 0), bool))
+    forbid = forbidden_shapes(cls, target_types)
+    path = densify_path_np(gt_pos, ref_coor)                     # (A, 2T, 2)
+    gt_touches = (shape_sdf_np(path, geom_w) < margin).any(axis=1)   # (A, S)
+
+    psi = np.asarray(ref_psi, dtype=np.float64).reshape(-1)
+    d = geom_w[np.newaxis, :, :2] - ref_coor[:, np.newaxis, :]   # (A, S, 2)
+    c, s = np.cos(-psi)[:, np.newaxis], np.sin(-psi)[:, np.newaxis]
+    th = geom_w[np.newaxis, :, G_TH] - psi[:, np.newaxis]
+    geom = np.stack([
+        d[..., 0] * c - d[..., 1] * s,
+        d[..., 1] * c + d[..., 0] * s,
+        np.broadcast_to(geom_w[:, G_HW], (A, S)),
+        np.broadcast_to(geom_w[:, G_HH], (A, S)),
+        np.cos(th), np.sin(th),
+        np.broadcast_to(geom_w[:, G_CIRC], (A, S)),
+    ], axis=-1)
+    return geom.astype(np.float32), forbid, forbid & ~gt_touches
 
 
 def rotate(data, cos_theta, sin_theta):
@@ -746,17 +1203,21 @@ def return_rel_e_feature(src_ref_coor, dst_ref_coor, src_ref_psi, dst_ref_psi):
 
 
 # =============================================================================
-# Map size (interaction range) based on agent type - SCALED by SCALE_FACTOR
-# INCREASED ranges for Bikers, Carts, and Skaters for better neighbor context
-# Original pixel values scaled down by 50
+# How far an agent sees OTHER AGENTS, by its own type. SCALED (x50 = pixels),
+# and the velocity term in the collate fn adds 2 x the current per-frame speed
+# on top, so a moving agent always sees further than a standing one.
+#
+# Identical to hdgt_goal (and every other version), so the agent-agent
+# interaction range is not a difference between versions. A +50 px widening of
+# every type but the pedestrian (275/300/300/250/275 px) was reverted to match.
 # =============================================================================
 map_size_lis = {
-    1: 3.0,   # Pedestrian: 150/50 = 3.0 (unchanged)
-    2: 4.5,   # Biker: 225/50 = 4.5 (increased from 4.0)
-    3: 5.0,   # Car: 250/50 = 5.0 (unchanged)
-    4: 5.0,   # Bus: 250/50 = 5.0 (unchanged)
-    5: 4.0,   # Cart: 200/50 = 4.0 (increased from 3.0)
-    6: 4.5    # Skater: 225/50 = 4.5 (increased from 4.0)
+    1: 3.0,   # Pedestrian: 150 px
+    2: 4.5,   # Biker:      225 px
+    3: 5.0,   # Car:        250 px
+    4: 5.0,   # Bus:        250 px
+    5: 4.0,   # Cart:       200 px
+    6: 4.5    # Skater:     225 px
 }
 
 
@@ -768,7 +1229,12 @@ def SDD_collate_fn(batch, args, is_train):
         return None
 
     agent_drop = args.agent_drop if hasattr(args, 'agent_drop') else 0.0
+    # Map nodes/edges in the graph. The map loss geometry below is built either
+    # way (it is cheap), so the map penalties and metrics work without them too.
+    use_map = bool(getattr(args, 'use_map', False))
+    map_margin = 0.0   # a point outside every shape is never penalised
 
+    scene_map_lis = [item["scene_map"] for item in batch]
     agent_feature_lis = [item["agent_feature"] for item in batch]
     agent_type_lis = [item["agent_type"] for item in batch]
     pred_num_lis = np.array([item["pred_num"] for item in batch])
@@ -805,6 +1271,9 @@ def SDD_collate_fn(batch, args, is_train):
     out_label_vel_lis = []
     out_goal_pos_lis = []
     out_label_mask_lis = []
+    out_map_geom_lis = []
+    out_map_forbid_lis = []
+    out_map_loss_lis = []
 
     for i in range(len(agent_feature_lis)):
         # Compute agent map size (values are already in SCALED coordinates)
@@ -818,11 +1287,37 @@ def SDD_collate_fn(batch, args, is_train):
         all_agent_map_size = all_agent_obs_final_v * 2.0 + all_agent_map_size
 
         # Generate graph
-        graph_dic = generate_heterogeneous_graph(agent_feature_lis[i], all_agent_map_size)
-        g = dgl.heterograph(data_dict=graph_dic["uv_dic"])
+        now_scene_map = scene_map_lis[i]
+        graph_dic = generate_heterogeneous_graph(
+            agent_feature_lis[i], all_agent_map_size, agent_type_lis[i],
+            scene_map=now_scene_map if use_map else None,
+            pred_len=args.pred_len)
+        if use_map:
+            # Explicit node counts: a shape with no edges is still a node.
+            g = dgl.heterograph(data_dict=graph_dic["uv_dic"], num_nodes_dict={
+                "agent": int(agent_feature_lis[i].shape[0]),
+                "map": int(now_scene_map["geom"].shape[0])})
+        else:
+            g = dgl.heterograph(data_dict=graph_dic["uv_dic"])
 
         now_agent_feature = agent_feature_lis[i]
         now_agent_type = agent_type_lis[i]
+
+        if use_map:
+            # Map nodes: own-frame size and shape kind; the class is the node type.
+            # Where a shape sits relative to an agent lives on the m2a edge,
+            # the same way agent positions live on agent-agent edges.
+            map_cls = now_scene_map["cls"]
+            g.nodes["map"].data["m_n_fea"] = torch.as_tensor(now_scene_map["node_fea"])
+            g.nodes["map"].data["m_n_type"] = torch.as_tensor(map_cls).long()
+            # Edge order in g is the order the edges were given in, so the
+            # features line up with g.edges(etype=...) by construction.
+            m2a_u, _ = g.edges(etype="m2a")
+            g.edges["m2a"].data["m2a_e_fea"] = torch.as_tensor(graph_dic["m2a_fea"]).reshape(-1, M2A_EDGE_FEA_DIM)
+            g.edges["m2a"].data["m2a_e_type"] = torch.as_tensor(map_cls[m2a_u.numpy()]).long().reshape(-1)
+            m2m_u, _ = g.edges(etype="m2m")
+            g.edges["m2m"].data["m2m_e_fea"] = torch.as_tensor(graph_dic["m2m_fea"]).reshape(-1, M2M_EDGE_FEA_DIM)
+            g.edges["m2m"].data["m2m_e_type"] = torch.as_tensor(map_cls[m2m_u.numpy()]).long().reshape(-1)
 
         # Self-loop edges
         type0_u, type0_v = g.edges(etype="self")
@@ -923,11 +1418,38 @@ def SDD_collate_fn(batch, args, is_train):
         out_goal_pos_lis.append(now_goal_pos)
         out_label_mask_lis.append(label_mask_lis[i][selected_pred_indices])
 
+        # Map penalty geometry for the targets, in each target's own frame.
+        # label_pos_lis[i] is still the untouched WORLD GT (only copies were
+        # made relative above), which the exemption test needs.
+        map_geom, map_forbid, map_loss = build_map_loss_geometry(
+            now_scene_map, now_agent_type[selected_pred_indices], ref_coor,
+            ref_psi[:, 0], label_pos_lis[i][selected_pred_indices], margin=map_margin)
+        out_map_geom_lis.append(map_geom)
+        out_map_forbid_lis.append(map_forbid)
+        out_map_loss_lis.append(map_loss)
+
     # Batch everything
     output_dic = {}
     output_dic["cuda_tensor_lis"] = [
-        "graph_lis", "label_lis", "label_pos_lis", "goal_pos_lis", "label_mask_lis"
+        "graph_lis", "label_lis", "label_pos_lis", "goal_pos_lis", "label_mask_lis",
+        "map_geom_lis", "map_forbid_mask_lis", "map_loss_mask_lis",
     ]
+
+    # Map penalty geometry, one row per target agent, padded to the largest
+    # shape count in the batch. Padding has both masks False.
+    s_max = max(m.shape[1] for m in out_map_geom_lis)
+    geom_pad, forbid_pad, loss_pad = [], [], []
+    for geom_i, forbid_i, loss_i in zip(out_map_geom_lis, out_map_forbid_lis, out_map_loss_lis):
+        pad = s_max - geom_i.shape[1]
+        geom_pad.append(np.pad(geom_i, ((0, 0), (0, pad), (0, 0))))
+        forbid_pad.append(np.pad(forbid_i, ((0, 0), (0, pad)), constant_values=False))
+        loss_pad.append(np.pad(loss_i, ((0, 0), (0, pad)), constant_values=False))
+    # (N, S, 7) [cx, cy, half_w, half_h, cos, sin, is_circle], each agent's frame
+    output_dic["map_geom_lis"] = torch.as_tensor(np.concatenate(geom_pad, axis=0).astype(np.float32))
+    # (N, S) shape is off limits for the agent's type (for metrics)
+    output_dic["map_forbid_mask_lis"] = torch.as_tensor(np.concatenate(forbid_pad, axis=0))
+    # (N, S) off limits AND not entered by the agent's own GT (for the loss)
+    output_dic["map_loss_mask_lis"] = torch.as_tensor(np.concatenate(loss_pad, axis=0))
 
     # Velocity labels for diffusion training (SCALED, per-frame)
     output_dic["label_lis"] = torch.as_tensor(np.concatenate(out_label_vel_lis, axis=0).astype(np.float32))
@@ -957,6 +1479,19 @@ def SDD_collate_fn(batch, args, is_train):
         torch.where(output_g.nodes["agent"].data["a_n_type"] == _)[0]
         for _ in range(6)
     ]
+
+    if use_map:
+        # Map edges are grouped by the class of their SOURCE shape, the same way
+        # agent edges are grouped by their source agent's type.
+        for out_etype, fea_name in (("m2a", "m2a_e_type"), ("m2m", "m2m_e_type")):
+            a_e_type_dict[out_etype] = [
+                torch.where(output_g.edges[out_etype].data[fea_name] == map_type_index)[0]
+                for map_type_index in range(NUM_MAP_TYPES)
+            ]
+        output_dic["m_n_type_lis"] = [
+            torch.where(output_g.nodes["map"].data["m_n_type"] == _)[0]
+            for _ in range(NUM_MAP_TYPES)
+        ]
 
     output_dic["a_e_type_dict"] = a_e_type_dict
     output_dic["a_n_type_lis"] = a_n_type_lis

@@ -168,6 +168,40 @@ def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_d
     return lines
 
 
+def map_block(map_rows, agent_type_lis):
+    """MAP COMPLIANCE, a map component diagnostic: how often predicted paths enter a
+    shape their agent may not enter (obstacles for everyone, grass for all but
+    pedestrians), with the GT's own rate beside it, since annotated paths clip
+    outlines and cross parking areas too. Every path is densified (each step's
+    midpoint added), the same point set the training penalties use."""
+    lines = [
+        "MAP COMPLIANCE  (paths entering a shape their agent may not enter, 12 steps)",
+        "-" * 80,
+        "  GT     : % of ground-truth paths that enter one",
+        "  top-1  : % of the first predicted paths that enter one",
+        "  all K  : % of all K predicted paths that enter one",
+        "  depth  : mean depth of the deepest point of the first paths that enter one, px",
+        "",
+        f"  {'Type':<12}{'N':>6}{'GT':>9}{'top-1':>9}{'all K':>9}{'depth':>9}",
+        "  " + "-" * 54,
+    ]
+    rows = {"ALL": [r for at in agent_type_lis for r in map_rows[at]]}
+    rows.update({at: map_rows[at] for at in agent_type_lis})
+    inside_px = 0.01   # deeper than this counts as inside (ignores rounding on an outline)
+    for name in ["ALL"] + agent_type_lis:
+        if not rows[name]:
+            continue
+        chains = np.concatenate([r["chains"] for r in rows[name]], axis=0)   # (M, K) deepest point, px
+        gt = np.concatenate([r["gt"] for r in rows[name]], axis=0)           # (M,)
+        top1 = chains[:, 0]
+        entering = top1 > inside_px
+        depth = top1[entering].mean() if entering.any() else 0.0
+        lines.append(f"  {name:<12}{len(gt):>6}{100 * (gt > inside_px).mean():>8.1f}%"
+                     f"{100 * entering.mean():>8.1f}%{100 * (chains > inside_px).mean():>8.1f}%{depth:>9.2f}")
+    lines.append("=" * 80)
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -293,6 +327,8 @@ def main():
     # Scorer: read from the checkpoint's weights by default, so the model is rebuilt as trained
     parser.add_argument("--use_scorer", type=str, default=None)
     parser.add_argument("--scorer_type", type=str, default=None, choices=["mode", "traj"])
+    # Map nodes in the graph: read from the checkpoint by default
+    parser.add_argument("--use_map", type=str, default=None)
 
     args = parser.parse_args()
     args.use_refiner = (args.use_refiner == "True")
@@ -341,6 +377,13 @@ def main():
         args.use_scorer = "True" if scorer_in_weights else "False"
     if args.scorer_type is None:
         args.scorer_type = scorer_in_weights or "mode"
+    # Map nodes in the graph, as trained (the checkpoint's args, else its weights), unless given
+    if args.use_map is None:
+        saved = checkpoint.get("args", {}).get("use_map")
+        args.use_map = (saved if isinstance(saved, bool) else
+                        any(k.startswith("encoder.map_emb") for k in checkpoint["model_state_dict"]))
+    else:
+        args.use_map = (args.use_map == "True")
 
     model_module = importlib.import_module(args.model_module)
     model = model_module.HDGT_model(input_dim=8, args=args)
@@ -404,6 +447,9 @@ def main():
     # scorer's order, with the scorer's outputs for it. Per type, every trajectory counts once.
     use_scorer = getattr(model, "use_scorer", False)
     scorer_rows = {at: [] for at in agent_type_lis}
+    # Map compliance (map nodes only): each chain's and the GT's deepest point inside a
+    # forbidden shape, px
+    map_rows = {at: [] for at in agent_type_lis}
 
     print(f"\nRunning inference ...")
     t0 = time.time()
@@ -431,6 +477,14 @@ def main():
             label_pos  = data["label_pos_lis"]
             label_mask = data["label_mask_lis"]
 
+            if args.use_map:
+                pos_t = trajectories if output_is_positions else torch.cumsum(trajectories, dim=2)
+                geom, forbid = data["map_geom_lis"], data["map_forbid_mask_lis"]
+                depth_k = (model_module.map_depth(model_module.densify_path(pos_t), geom, forbid)
+                           .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()                  # (N, K)
+                depth_gt = (model_module.map_depth(model_module.densify_path(label_pos), geom, forbid)
+                            .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()                 # (N,)
+
             if use_scorer:
                 # All three come in the same order as the returned chains
                 goals_np = model.last_predicted_goals.cpu().numpy()                  # (N, K, 2)
@@ -449,6 +503,9 @@ def main():
 
                 # Chain 0: the scorer's pick with a scorer; the goal heads' first chain without one
                 best_pred = preds[:, 0, :, :]
+
+                if args.use_map:
+                    map_rows[at].append({"chains": depth_k[mask], "gt": depth_gt[mask]})
 
                 if use_scorer:
                     ade_k, fde_k = chain_errors(preds, labels, masks, scale_factor=SCALE_FACTOR)
@@ -503,6 +560,7 @@ def main():
         f"K samples   : {args.num_prediction}",
         f"Refiner     : {'ON' if args.use_refiner else 'OFF'}",
         f"Scorer      : {scorer_desc}",
+        f"Map         : {'ON (shapes in the graph; agents attend to them in every GNN layer)' if args.use_map else 'OFF'}",
         f"Random seed : {args.seed}",
         f"Eval time   : {elapsed_total:.1f}s",
         sep,
@@ -514,6 +572,8 @@ def main():
 
     if use_scorer:
         lines += scorer_block(scorer_rows, agent_type_lis, args.num_prediction, args.pred_len, scorer_desc)
+    if args.use_map:
+        lines += map_block(map_rows, agent_type_lis)
 
     report = "\n".join(lines)
 

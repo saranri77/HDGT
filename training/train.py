@@ -142,7 +142,7 @@ parser.add_argument('--goal_loss_weight', type=float, default=0.5, help='weight 
 parser.add_argument('--goal_curriculum_epochs', type=int, default=10, help='epochs to ramp oracle→predicted goal')
 
 #### Scorer: ranks the K refined chains (index 0 = the single-trajectory prediction)
-parser.add_argument('--use_scorer', type=str, default="True", help='rank the K chains with a scorer; False = just goal-aware, as hdgt_goal_WTA_regressor (confidence head trained, chains left in the goal heads\' order)')
+parser.add_argument('--use_scorer', type=str, default="False", help='rank the K chains with a scorer (off by default in this version); False = just goal-aware, as hdgt_goal_WTA_regressor (confidence head trained, chains left in the goal heads\' order)')
 parser.add_argument('--scorer_type', type=str, default="mode", choices=["mode", "traj"], help='mode = ModeScorer (hand-made features of each chain), traj = TrajScorer (raw chains, attention across them and to the neighbours)')
 parser.add_argument('--scorer_loss_weight', type=float, default=0.5, help='weight on the scorer loss, applied once the goal curriculum is done (isolated: cannot affect the generator); 0.5 = hdgt_bridge\'s effective weight')
 parser.add_argument('--scorer_err_weight', type=float, default=1.0, help='ModeScorer only: weight on the per-mode log-ADE regression inside its loss')
@@ -151,6 +151,16 @@ parser.add_argument('--scorer_dropout', type=str, default="False", help='use --d
 parser.add_argument('--conf_tau_min', type=float, default=0.02, help='TrajScorer only: floor for the adaptive soft-target temperature, scaled units (0.02 = 1 px)')
 parser.add_argument('--conf_goal_blend', type=float, default=0.5, help='TrajScorer only: weight of goal-space distance in the soft target')
 parser.add_argument('--conf_sharpen', type=float, default=1.0, help='TrajScorer only: sharpness of the soft target')
+
+#### Map: through the graph only; every penalty optional and off by default
+parser.add_argument('--use_map', type=str, default="True", help='add the grass/obstacle shapes to the graph as map nodes: agents attend to them in every GNN layer, so the map shapes the agent embedding (True/False)')
+parser.add_argument('--goal_map_penalty', type=str, default="False", help='penalise predicted goals inside a shape their agent may not enter (obstacles for everyone, grass for all but pedestrians): cost = weight x depth inside, linear, 0 outside (True/False)')
+parser.add_argument('--goal_map_penalty_weight', type=float, default=0.1, help='weight of --goal_map_penalty, in [0, 1]')
+parser.add_argument('--diffusion_map_penalty', type=str, default="False", help="penalise the denoiser's recovered paths inside such shapes, the same way (True/False)")
+parser.add_argument('--diffusion_map_penalty_weight', type=float, default=0.1, help='weight of --diffusion_map_penalty, in [0, 1]')
+parser.add_argument('--refiner_map_penalty', type=str, default="False", help='penalise the refined paths inside such shapes, the same way (True/False)')
+parser.add_argument('--refiner_map_penalty_weight', type=float, default=0.1, help='weight of --refiner_map_penalty, in [0, 1]')
+parser.add_argument('--map_penalty_gt_exempt', type=str, default="True", help="leave out, for each agent, the shapes its own GT path enters, so a penalty never pushes against the GT (True/False)")
 
 #### Log
 parser.add_argument('--use_val_split', type=str, default="True", help='select checkpoints on the held-out VAL videos (True) instead of the test set (False, leaks)')
@@ -354,6 +364,14 @@ def main_worker(gpu, gpu_count, global_seed, args):
     
     args.use_refiner = (args.use_refiner == "True")
     args.use_val_split = (args.use_val_split == "True")
+    args.use_map = (args.use_map == "True")
+    map_penalties = [part for part in ("goal", "diffusion", "refiner") if flag_on(getattr(args, f"{part}_map_penalty"))]
+    if map_penalties and not args.use_map:
+        raise ValueError(f"--{map_penalties[0]}_map_penalty needs --use_map True")
+    print(f"Map: shapes in the graph {'ON' if args.use_map else 'OFF'}; penalties: "
+          + (", ".join(f"{part} (weight {getattr(args, part + '_map_penalty_weight')})" for part in map_penalties)
+             or "none")
+          + (f"; shapes the agent's own GT path enters exempt: {args.map_penalty_gt_exempt}" if map_penalties else ""))
 
     model = model_module.HDGT_model(input_dim=8, args=args)
     model.apply(model_module.weights_init)
@@ -369,6 +387,10 @@ def main_worker(gpu, gpu_count, global_seed, args):
     if args.checkpoint != "none":
         print("Loading checkpoint:", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        ckpt_has_map = any(k.startswith("encoder.map_emb") for k in checkpoint["model_state_dict"])
+        if ckpt_has_map != args.use_map:
+            raise RuntimeError(f"--use_map {args.use_map}, but the checkpoint {'has' if ckpt_has_map else 'has no'} "
+                               f"map weights: resume it with --use_map {ckpt_has_map}")
         model.load_state_dict(checkpoint["model_state_dict"])
 
     model = model.to(device, non_blocking=True)
@@ -571,6 +593,9 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                             recorder["scorer_cls"].update(_m.last_scorer_cls.item(), num_of_sample)
                             if getattr(_m, "last_scorer_err", None) is not None:    # ModeScorer only
                                 recorder["scorer_err"].update(_m.last_scorer_err.item(), num_of_sample)
+                        # The switched-on map penalties (unweighted), stashed like the scorer's
+                        for part, value in getattr(_m, "last_map_penalties", {}).items():
+                            recorder.setdefault(f"map_{part}", AverageMeter()).update(value.item(), num_of_sample)
 
                     if writer is not None and is_train:
                         current_step = global_step + batch_index
@@ -657,6 +682,10 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                             else:                                       # TrajScorer: KL to the soft target
                                 scorer_text = f"Scorer(kl): {recorder['scorer_cls'].avg:.3f}"
                             print_text += scorer_text + f"{'' if gated else ' [not applied yet]'}, "
+                        map_parts = [part for part in ("goal", "diffusion", "refiner") if f"map_{part}" in recorder]
+                        if map_parts:
+                            print_text += ("MapPenalty(" + "/".join(map_parts) + "): "
+                                           + "/".join(f"{recorder[f'map_{part}'].avg:.4f}" for part in map_parts) + ", ")
                         print_text += f"Curriculum: {model_ref_log.goal_curriculum_alpha:.3f}, "
                         print_text += f"Time: {time.time()-start_time:.2f}s, "
                         print_text += f"LR: {scheduler.get_last_lr()[0]:.2e}"
@@ -678,6 +707,9 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                                 writer.add_scalar('Train_Epoch/scorer_cls', recorder["scorer_cls"].avg, epoch)
                                 if recorder["scorer_err"].count > 0:
                                     writer.add_scalar('Train_Epoch/scorer_err', recorder["scorer_err"].avg, epoch)
+                            for part in ("goal", "diffusion", "refiner"):
+                                if f"map_{part}" in recorder:
+                                    writer.add_scalar(f'Train_Epoch/map_{part}_penalty', recorder[f"map_{part}"].avg, epoch)
 
                         # Reset recorder
                         recorder = {}

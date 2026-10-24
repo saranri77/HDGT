@@ -1,6 +1,22 @@
 """
-model.py
+model.py  (hdgt_map_gnn)
 ========
+
+hdgt_goal plus the scene map, which reaches the model THROUGH THE GRAPH ONLY.
+Grass and obstacle shapes (sdd/shapes, drawn with draw_shapes.py) are "map"
+nodes; map->map edges link nearby shapes and map->agent edges link each agent to
+the shapes near it. In every GNN layer each agent attends to its agent
+neighbours and, separately, to its nearby shapes (AgentHetGNN), and the shapes
+update over each other (MapHetGNN). The map thereby shapes the 256-D agent
+embedding that the goal predictor, the diffusion decoder and the refiner read;
+nothing else sees the map. Those three modules, the scorers and every loss are
+hdgt_goal's, unchanged.
+
+Optional map penalties, each off by default and weighted in [0, 1]
+(--goal_map_penalty, --diffusion_map_penalty, --refiner_map_penalty): a point of
+a predicted goal or path inside a shape its agent may not enter (obstacles for
+every agent, grass for every agent but pedestrians) costs its depth inside,
+linearly (see map_depth); a point outside costs nothing.
 
 Self-contained copy of the full HDGT model in which the goal predictor is a
 **multimodal K-head Winner-Takes-All (MTP-style) predictor** `GoalPredictorMTP`:
@@ -46,6 +62,70 @@ import dgl
 import math
 import dgl.function as fn
 from functools import partial
+
+
+# =============================================================================
+# Map elements: the graph's "map" nodes and the optional penalties
+# =============================================================================
+NUM_MAP_TYPES = 2          # 0 grass, 1 obstacle
+MAP_NODE_FEA_DIM = 3       # [w, h, is_circle], own frame
+M2A_EDGE_FEA_DIM = 7       # [rel_c(2), nearest outline point(2), signed dist, cos2d, sin2d]
+M2M_EDGE_FEA_DIM = 5       # [rel_c(2), gap, cos2d, sin2d]
+# Columns of each agent's shape geometry from the collate fn (map_geom_lis), agent frame
+_MG_CX, _MG_CY, _MG_HW, _MG_HH, _MG_COS, _MG_SIN, _MG_CIRC = range(7)
+
+
+def densify_path(pos):
+    """(..., T, 2) positions relative to the agent's last observed position ->
+    (..., 2T, 2): each segment's midpoint followed by its end point, the first
+    segment starting at the origin. A step of 0.4 s can carry a biker over a
+    thin shape, so the midpoints catch paths that jump across one. Same point
+    set as sdd_dataset.densify_path_np, which the GT exemption uses.
+    """
+    prev = torch.cat([torch.zeros_like(pos[..., :1, :]), pos[..., :-1, :]], dim=-2)
+    mid = 0.5 * (prev + pos)
+    return torch.stack([mid, pos], dim=-2).reshape(*pos.shape[:-2], 2 * pos.shape[-2], 2)
+
+
+def map_signed_distance(points, geom):
+    """Signed distance of points to shapes, negative inside.
+
+    points (N, P, 2), geom (N, S, 7) in the same (agent) frame -> (N, P, S).
+    Float32 on purpose: under fp16 autocast the 1e-12 guard underflows and the
+    sqrt gradient at 0 turns into inf * 0 = NaN.
+    """
+    p = points.float().unsqueeze(2)                     # (N, P, 1, 2)
+    g = geom.float().unsqueeze(1)                       # (N, 1, S, 7)
+    dx = p[..., 0] - g[..., _MG_CX]
+    dy = p[..., 1] - g[..., _MG_CY]
+    c, s = g[..., _MG_COS], g[..., _MG_SIN]
+    u = dx * c + dy * s
+    v = -dx * s + dy * c
+    qx = u.abs() - g[..., _MG_HW]
+    qy = v.abs() - g[..., _MG_HH]
+    outside = torch.sqrt(qx.clamp(min=0) ** 2 + qy.clamp(min=0) ** 2 + 1e-12) - 1e-6
+    inside = torch.maximum(qx, qy).clamp(max=0)
+    sd_circ = torch.sqrt(dx * dx + dy * dy + 1e-12) - g[..., _MG_HW]
+    return torch.where(g[..., _MG_CIRC] > 0.5, sd_circ, outside + inside)
+
+
+def map_depth(points, geom, mask):
+    """How deep each point is inside the shapes selected by mask, in scaled units
+    (x SCALE_FACTOR = pixels).
+
+    points (N, ..., 2), geom (N, S, 7), mask (N, S) bool -> (N, ...). Linear in the
+    depth: 0 for a point outside every selected shape, otherwise its distance to
+    the nearest way out of the deepest selected shape containing it, so the
+    gradient pushes the point out through the closest edge. Overlapping shapes
+    are not counted twice.
+    """
+    n, lead = points.shape[0], points.shape[1:-1]
+    flat = points.reshape(n, -1, 2)
+    if geom.shape[1] == 0:
+        return flat.new_zeros((n,) + tuple(lead)).float()
+    depth = F.relu(-map_signed_distance(flat, geom))               # (N, P, S)
+    depth = depth * mask.unsqueeze(1).to(depth.dtype)
+    return depth.max(dim=-1).values.reshape((n,) + tuple(lead))
 
 
 # =============================================================================
@@ -235,6 +315,16 @@ class PositionwiseFeedForward(nn.Module):
 # =============================================================================
 
 class AgentHetGNN(nn.Module):
+    """One layer of agent updates.
+
+    Each agent fuses three streams: itself (self-loop edge), attention over its
+    agent neighbours ("other" edges), and with use_map, attention over the map
+    elements near it ("m2a" edges). Queries are per agent type; keys/values per
+    SOURCE type (agent type for "other", map class for "m2a"). Edge states are
+    refreshed from [source, edge, destination] like the original HDGT.
+    With use_map=False the module and its parameter names are exactly the
+    agent-only version, so old checkpoints still load.
+    """
     def __init__(self, args):
         super().__init__()
         self.norm = nn.LayerNorm
@@ -242,6 +332,7 @@ class AgentHetGNN(nn.Module):
         self.head_dim = args.head_dim
         self.d_model = args.hidden_dim
         self.n_head = self.d_model//args.head_dim
+        self.use_map = bool(getattr(args, "use_map", False))
         d_k = self.head_dim
         d_v = self.head_dim
         self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5), args=args)
@@ -258,50 +349,73 @@ class AgentHetGNN(nn.Module):
                 nn.Linear(self.d_model, self.n_head * d_k * 2, bias=False)
             ) for _ in range(6)])
 
-        self.attn_fcs = nn.ModuleList([nn.ModuleDict({
-            "other": nn.Sequential(
+        def _attn_fc():
+            return nn.Sequential(
                 nn.Linear(self.n_head * d_v, self.d_model, bias=True),
                 nn.ReLU(inplace=True)
             )
-        }) for agent_type_index in range(6)])
-        
+        self.attn_fcs = nn.ModuleList([nn.ModuleDict(
+            {"other": _attn_fc(), "m2a": _attn_fc()} if self.use_map else {"other": _attn_fc()}
+        ) for agent_type_index in range(6)])
+
         self.self_fc = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim, bias=True),
                 nn.ReLU(inplace=True)
             ) for _ in range(6)])
-        
+
+        n_streams = 3 if self.use_map else 2   # self, other agents[, map]
         self.out_fc = nn.ModuleList([nn.Sequential(
-            nn.Linear(self.hidden_dim*2, self.hidden_dim, bias=True),
+            nn.Linear(self.hidden_dim*n_streams, self.hidden_dim, bias=True),
             nn.Dropout(args.dropout) if args.dropout > 0.0 else nn.Identity()
         ) for _ in range(6)])
-                
+
         self.out_ffn = nn.ModuleList([PositionwiseFeedForward(args.hidden_dim, args.hidden_dim*4, args.dropout, nn.LayerNorm)
             for _ in range(6)])
 
         self.etype_dic = {
             "other": (partial(self.message_func, etype="other"), partial(self.reduce_func, etype="other"))
         }
-        self.etype2hidden_name = {"other": "a_e_hidden"}
+        self.etype2hidden_name = {"other": "a_e_hidden", "m2a": "m2a_e_hidden"}
+        self.etype2out_name = {"other": "a_n_hidden_out", "m2a": "m2a_n_hidden_out"}
 
         self.edge_MLP = {}
         self.edge_MLP["self"] = nn.ModuleList([MLP(args.hidden_dim, args.hidden_dim, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True)
             for _ in range(6)])
         self.edge_MLP["other"] = nn.ModuleList([MLP(args.hidden_dim*3, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True)
             for _ in range(6)])
+        if self.use_map:
+            # Map attention gets its own query: "which shape matters" is a
+            # different question from "which neighbour matters".
+            self.wqs_map = nn.ModuleList([nn.Sequential(
+                self.norm(self.d_model),
+                nn.Linear(self.d_model, self.n_head * d_k, bias=False),
+            ) for _ in range(6)])
+            self.wkvs["m2a"] = nn.ModuleList([
+                nn.Sequential(
+                    self.norm(self.d_model),
+                    nn.Linear(self.d_model, self.n_head * d_k * 2, bias=False)
+                ) for _ in range(NUM_MAP_TYPES)])
+            self.edge_MLP["m2a"] = nn.ModuleList([MLP(args.hidden_dim*3, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, dropout=args.dropout, prenorm=True)
+                for _ in range(NUM_MAP_TYPES)])
         self.edge_MLP = nn.ModuleDict(self.edge_MLP)
 
     def forward(self, input_dic):
+        """Returns (agent node states, [self, other(, m2a)] edge states)."""
         self.a_e_type_dict = input_dic["a_e_type_dict"]
         self.a_n_type_lis = input_dic["a_n_type_lis"]
         with input_dic["graph_lis"].local_scope():
-            self.device = "cuda:"+str(input_dic["gpu"])
-
             input_q = input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"]
+            self.device = input_q.device
+            # Per-type weights write their rows into one shared buffer. The
+            # .to(buffer.dtype) on each of these scatters is what makes --amp
+            # work: under autocast a Linear returns fp16/bf16 while the buffer
+            # was allocated fp32, and an index-assign refuses to mix dtypes.
+            # With --amp none it is a no-op.
             q = torch.zeros((input_q.shape[0], self.n_head * self.head_dim), device=self.device)
             for agent_type_index in range(6):
                 if len(self.a_n_type_lis[agent_type_index]) != 0:
-                    q[self.a_n_type_lis[agent_type_index]] = self.wqs[agent_type_index](input_q[self.a_n_type_lis[agent_type_index]])
+                    q[self.a_n_type_lis[agent_type_index]] = (self.wqs[agent_type_index](input_q[self.a_n_type_lis[agent_type_index]])).to(q.dtype)
 
             other_q = q.view(input_q.shape[0], self.n_head, self.head_dim)
             input_dic["graph_lis"].nodes["agent"].data["other_q"] = other_q
@@ -314,16 +428,38 @@ class AgentHetGNN(nn.Module):
             all_out_fea = input_dic["graph_lis"].nodes["agent"].data["a_n_hidden_out"]
 
             other_out_tmp_in = all_out_fea.squeeze(1) if len(all_out_fea.shape) == 3 else all_out_fea
+
+            if self.use_map:
+                g = input_dic["graph_lis"]
+                q_map = torch.zeros((num_nodes, self.n_head * self.head_dim), device=self.device)
+                for agent_type_index in range(6):
+                    if len(self.a_n_type_lis[agent_type_index]) != 0:
+                        q_map[self.a_n_type_lis[agent_type_index]] = (self.wqs_map[agent_type_index](input_q[self.a_n_type_lis[agent_type_index]])).to(q_map.dtype)
+                g.nodes["agent"].data["m2a_q"] = q_map.view(num_nodes, self.n_head, self.head_dim)
+                # Its own pass with its own output name, so the two attention
+                # results can never be mixed up by a cross-etype reducer. An
+                # agent with no shape in range gets zeros, like an agent with
+                # no neighbour does on "other".
+                g.nodes["agent"].data["m2a_n_hidden_out"] = torch.zeros(
+                    (num_nodes, self.n_head * self.head_dim), device=self.device)
+                if g.num_edges("m2a") > 0:
+                    g.update_all(partial(self.message_func, etype="m2a"),
+                                 partial(self.reduce_func, etype="m2a"), etype="m2a")
+                map_out_tmp_in = g.nodes["agent"].data["m2a_n_hidden_out"]
+
             input_self_fea = input_dic["graph_lis"].edges["self"].data["a_e_hidden"]
             all_out_n_fea = torch.zeros_like(input_q)
             for agent_type_index in range(6):
                 if len(self.a_n_type_lis[agent_type_index]) != 0:
                     other_out_fea = self.attn_fcs[agent_type_index]["other"](other_out_tmp_in[self.a_n_type_lis[agent_type_index]])
                     self_fea = self.self_fc[agent_type_index](input_self_fea[self.a_n_type_lis[agent_type_index]])
-                    out_n_fea = torch.stack([self_fea, other_out_fea], dim=1)
+                    streams = [self_fea, other_out_fea]
+                    if self.use_map:
+                        streams.append(self.attn_fcs[agent_type_index]["m2a"](map_out_tmp_in[self.a_n_type_lis[agent_type_index]]))
+                    out_n_fea = torch.stack(streams, dim=1)
                     out_n_fea = self.out_fc[agent_type_index](out_n_fea.view(out_n_fea.shape[0], -1)) + input_q[self.a_n_type_lis[agent_type_index]]
                     out_n_fea = self.out_ffn[agent_type_index](out_n_fea)
-                    all_out_n_fea[self.a_n_type_lis[agent_type_index]] = out_n_fea
+                    all_out_n_fea[self.a_n_type_lis[agent_type_index]] = (out_n_fea).to(all_out_n_fea.dtype)
 
             out_e_fea_lis = []
             self_e_fea_tmp_in = input_dic["graph_lis"].edges["self"].data["a_e_hidden"]
@@ -333,43 +469,167 @@ class AgentHetGNN(nn.Module):
             other_e_fea_tmp_out = torch.zeros((other_e_fea_tmp_in.shape[0], self.hidden_dim), device=self.device)
             for agent_type_index in range(6):
                 if len(self.a_e_type_dict["self"][agent_type_index]) != 0:
-                    self_e_fea_tmp_out[self.a_e_type_dict["self"][agent_type_index]] = self.edge_MLP["self"][agent_type_index](self_e_fea_tmp_in[self.a_e_type_dict["self"][agent_type_index]])
+                    self_e_fea_tmp_out[self.a_e_type_dict["self"][agent_type_index]] = (self.edge_MLP["self"][agent_type_index](self_e_fea_tmp_in[self.a_e_type_dict["self"][agent_type_index]])).to(self_e_fea_tmp_out.dtype)
                 if len(self.a_e_type_dict["other"][agent_type_index]) != 0:
-                    other_e_fea_tmp_out[self.a_e_type_dict["other"][agent_type_index]] = self.edge_MLP["other"][agent_type_index](other_e_fea_tmp_in[self.a_e_type_dict["other"][agent_type_index]])
+                    other_e_fea_tmp_out[self.a_e_type_dict["other"][agent_type_index]] = (self.edge_MLP["other"][agent_type_index](other_e_fea_tmp_in[self.a_e_type_dict["other"][agent_type_index]])).to(other_e_fea_tmp_out.dtype)
             out_e_fea_lis.append(self_e_fea_tmp_out + input_dic["graph_lis"].edges["self"].data["a_e_hidden"])
             out_e_fea_lis.append(other_e_fea_tmp_out + input_dic["graph_lis"].edges["other"].data["a_e_hidden"])
+
+            if self.use_map:
+                # Map -> agent edge refresh from [shape, edge, agent].
+                m2a_u, m2a_v = g.edges(etype="m2a")
+                m2a_e_hidden = g.edges["m2a"].data["m2a_e_hidden"]
+                m2a_e_fea_tmp_in = torch.cat([g.nodes["map"].data["m_n_hidden"][m2a_u], m2a_e_hidden,
+                                              g.nodes["agent"].data["a_n_hidden"][m2a_v]], dim=-1)
+                m2a_e_fea_tmp_out = torch.zeros((m2a_e_fea_tmp_in.shape[0], self.hidden_dim), device=self.device)
+                for map_type_index in range(NUM_MAP_TYPES):
+                    idx = self.a_e_type_dict["m2a"][map_type_index]
+                    if len(idx) != 0:
+                        m2a_e_fea_tmp_out[idx] = (self.edge_MLP["m2a"][map_type_index](m2a_e_fea_tmp_in[idx])).to(m2a_e_fea_tmp_out.dtype)
+                out_e_fea_lis.append(m2a_e_fea_tmp_out + m2a_e_hidden)
         return all_out_n_fea, out_e_fea_lis
 
     def message_func(self, edges, etype):
+        # Keys/values are projected per SOURCE type: agent type for "other",
+        # map class for "m2a". Indices are edge ids of that etype.
         tmp_input = edges.data[self.etype2hidden_name[etype]]
         tmp_output = torch.zeros((tmp_input.shape[0], self.n_head * self.head_dim * 2), device=self.device)
-        for agent_type_index in range(6):
-            if len(self.a_e_type_dict["other"][agent_type_index]) != 0:
-                tmp_output[self.a_e_type_dict["other"][agent_type_index]] = self.wkvs[etype][agent_type_index](tmp_input[self.a_e_type_dict["other"][agent_type_index]])
+        type_index_lis = self.a_e_type_dict[etype]
+        for src_type_index in range(len(type_index_lis)):
+            if len(type_index_lis[src_type_index]) != 0:
+                tmp_output[type_index_lis[src_type_index]] = (self.wkvs[etype][src_type_index](tmp_input[type_index_lis[src_type_index]])).to(tmp_output.dtype)
         k, v = tmp_output.view(-1, self.n_head, self.head_dim*2).split(dim=-1, split_size=self.head_dim)
         return {etype+"_k":k, etype+"_v":v}
 
     def reduce_func(self, nodes, etype):
+        out_name = self.etype2out_name[etype]
         if nodes.mailbox[etype+"_k"].shape[1] == 0:
             node_num = nodes.mailbox[etype+"_k"].shape[0]
-            return {"a_n_hidden_out": torch.zeros((node_num, self.n_head * self.head_dim), device=self.device)}
+            return {out_name: torch.zeros((node_num, self.n_head * self.head_dim), device=self.device)}
 
         node_num, neighbor_num, n_head, hidden = nodes.mailbox[etype+"_k"].shape
         q = nodes.data[etype+"_q"].view(node_num*self.n_head, -1).unsqueeze(1)
         k = nodes.mailbox[etype+"_k"].transpose(1, 2).reshape(node_num*self.n_head, neighbor_num, -1)
         v = nodes.mailbox[etype+"_v"].transpose(1, 2).reshape(node_num*self.n_head, neighbor_num, -1)
         output, attn = self.attention(q, k, v, mask=None)
-        return {"a_n_hidden_out":output.view(node_num, -1)}
+        return {out_name:output.view(node_num, -1)}
+
+
+class MapHetGNN(nn.Module):
+    """One layer of map-node updates (use_map only).
+
+    A shape fuses itself with attention over the shapes near it ("m2m" edges),
+    so the pieces of one region (a building drawn as three rectangles, a lawn
+    drawn as several circles) share context before agents read them. Map nodes
+    never read agents: the map is static scene context, and nothing is
+    predicted for it. Weights are per map class (grass / obstacle).
+
+    update_edges=False skips the m2m edge refresh, for the last map layer,
+    whose refreshed edges no later layer would read.
+    """
+    def __init__(self, args, update_edges=True):
+        super().__init__()
+        self.update_edges = update_edges
+        self.hidden_dim = args.hidden_dim
+        self.head_dim = args.head_dim
+        self.n_head = args.hidden_dim // args.head_dim
+        H, d_k = self.hidden_dim, self.head_dim
+        self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5), args=args)
+        self.wqs = nn.ModuleList([nn.Sequential(
+            nn.LayerNorm(H), nn.Linear(H, self.n_head * d_k, bias=False),
+        ) for _ in range(NUM_MAP_TYPES)])
+        self.wkvs = nn.ModuleList([nn.Sequential(
+            nn.LayerNorm(H), nn.Linear(H, self.n_head * d_k * 2, bias=False),
+        ) for _ in range(NUM_MAP_TYPES)])
+        self.attn_fcs = nn.ModuleList([nn.Sequential(
+            nn.Linear(self.n_head * d_k, H, bias=True), nn.ReLU(inplace=True),
+        ) for _ in range(NUM_MAP_TYPES)])
+        self.self_fc = nn.ModuleList([nn.Sequential(
+            nn.Linear(H, H, bias=True), nn.ReLU(inplace=True),
+        ) for _ in range(NUM_MAP_TYPES)])
+        self.out_fc = nn.ModuleList([nn.Sequential(
+            nn.Linear(H * 2, H, bias=True),
+            nn.Dropout(args.dropout) if args.dropout > 0.0 else nn.Identity(),
+        ) for _ in range(NUM_MAP_TYPES)])
+        self.out_ffn = nn.ModuleList([PositionwiseFeedForward(H, H * 4, args.dropout, nn.LayerNorm)
+                                      for _ in range(NUM_MAP_TYPES)])
+        if self.update_edges:
+            self.edge_MLP = nn.ModuleList([MLP(H * 3, H * 4, H, nn.LayerNorm, dropout=args.dropout, prenorm=True)
+                                           for _ in range(NUM_MAP_TYPES)])
+
+    def forward(self, input_dic):
+        """Returns (map node states, m2m edge states — unchanged if not update_edges)."""
+        g = input_dic["graph_lis"]
+        m_n_type_lis = input_dic["m_n_type_lis"]
+        self.m2m_type_lis = input_dic["a_e_type_dict"]["m2m"]
+        with g.local_scope():
+            h = g.nodes["map"].data["m_n_hidden"]
+            self.device = h.device
+            num_nodes = h.shape[0]
+            q = torch.zeros((num_nodes, self.n_head * self.head_dim), device=self.device)
+            for map_type_index in range(NUM_MAP_TYPES):
+                idx = m_n_type_lis[map_type_index]
+                if len(idx) != 0:
+                    q[idx] = (self.wqs[map_type_index](h[idx])).to(q.dtype)
+            g.nodes["map"].data["m2m_q"] = q.view(num_nodes, self.n_head, self.head_dim)
+            g.nodes["map"].data["m2m_n_hidden_out"] = torch.zeros(
+                (num_nodes, self.n_head * self.head_dim), device=self.device)
+            if g.num_edges("m2m") > 0:
+                g.update_all(self.message_func, self.reduce_func, etype="m2m")
+            agg = g.nodes["map"].data["m2m_n_hidden_out"]
+
+            out_n = torch.zeros_like(h)
+            for map_type_index in range(NUM_MAP_TYPES):
+                idx = m_n_type_lis[map_type_index]
+                if len(idx) != 0:
+                    fused = torch.cat([self.self_fc[map_type_index](h[idx]),
+                                       self.attn_fcs[map_type_index](agg[idx])], dim=-1)
+                    o = self.out_fc[map_type_index](fused) + h[idx]
+                    out_n[idx] = (self.out_ffn[map_type_index](o)).to(out_n.dtype)
+
+            e_hidden = g.edges["m2m"].data["m2m_e_hidden"]
+            if not self.update_edges:
+                return out_n, e_hidden
+            m2m_u, m2m_v = g.edges(etype="m2m")
+            e_in = torch.cat([h[m2m_u], e_hidden, h[m2m_v]], dim=-1)
+            e_out = torch.zeros((e_in.shape[0], self.hidden_dim), device=self.device)
+            for map_type_index in range(NUM_MAP_TYPES):
+                idx = self.m2m_type_lis[map_type_index]
+                if len(idx) != 0:
+                    e_out[idx] = (self.edge_MLP[map_type_index](e_in[idx])).to(e_out.dtype)
+        return out_n, e_out + e_hidden
+
+    def message_func(self, edges):
+        tmp_input = edges.data["m2m_e_hidden"]
+        tmp_output = torch.zeros((tmp_input.shape[0], self.n_head * self.head_dim * 2), device=self.device)
+        for map_type_index in range(NUM_MAP_TYPES):
+            idx = self.m2m_type_lis[map_type_index]
+            if len(idx) != 0:
+                tmp_output[idx] = (self.wkvs[map_type_index](tmp_input[idx])).to(tmp_output.dtype)
+        k, v = tmp_output.view(-1, self.n_head, self.head_dim * 2).split(dim=-1, split_size=self.head_dim)
+        return {"m2m_k": k, "m2m_v": v}
+
+    def reduce_func(self, nodes):
+        k_in = nodes.mailbox["m2m_k"]
+        node_num, neighbor_num = k_in.shape[0], k_in.shape[1]
+        if neighbor_num == 0:
+            return {"m2m_n_hidden_out": torch.zeros((node_num, self.n_head * self.head_dim), device=self.device)}
+        q = nodes.data["m2m_q"].view(node_num * self.n_head, -1).unsqueeze(1)
+        k = k_in.transpose(1, 2).reshape(node_num * self.n_head, neighbor_num, -1)
+        v = nodes.mailbox["m2m_v"].transpose(1, 2).reshape(node_num * self.n_head, neighbor_num, -1)
+        output, _ = self.attention(q, k, v, mask=None)
+        return {"m2m_n_hidden_out": output.view(node_num, -1)}
 
 
 class HDGT_encoder(nn.Module):
-    """HDGT encoder - simplified agent-only version"""
+    """HDGT encoder: agent nodes, plus map nodes when args.use_map."""
     def __init__(self, input_dim, args):
         super().__init__()
         self.hidden_dim = args.hidden_dim
+        self.use_map = bool(getattr(args, "use_map", False))
         self.shared_coor_encoder = MLP(d_in=2, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None)
         self.shared_rel_encoder = MLP(d_in=4, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None)
-        
+
         self.agent_emb = Agent2embedding(input_dim, args)
         self.temporal_encoders = torch.nn.ModuleList([AgentTemporalEncoder(args) for _ in range(6)])
         self.agent_e_fea_MLPs = torch.nn.ModuleList([MLP(args.hidden_dim+args.hidden_dim//4, args.hidden_dim*4, args.hidden_dim, norm=BN1D) for _ in range(6)])
@@ -377,35 +637,95 @@ class HDGT_encoder(nn.Module):
         self.num_of_gnn_layer = args.num_of_gnn_layer
         self.agent_gnns = torch.nn.ModuleList([AgentHetGNN(args=args) for _ in range(self.num_of_gnn_layer)])
 
+        if self.use_map:
+            H = args.hidden_dim
+            # LayerNorm, not the BatchNorm the agent MLPs use: a batch holds many
+            # copies of the same few shapes, and a class can be absent or single.
+            self.map_emb = nn.ModuleList([MLP(MAP_NODE_FEA_DIM, H//2, H, norm=nn.LayerNorm)
+                                          for _ in range(NUM_MAP_TYPES)])
+            self.m2a_rel_encoder = MLP(d_in=M2A_EDGE_FEA_DIM, d_hid=H//8, d_out=H//4, norm=None)
+            self.m2m_rel_encoder = MLP(d_in=M2M_EDGE_FEA_DIM, d_hid=H//8, d_out=H//4, norm=None)
+            self.m2a_e_fea_MLPs = nn.ModuleList([MLP(H + H//4, H*4, H, norm=nn.LayerNorm)
+                                                 for _ in range(NUM_MAP_TYPES)])
+            self.m2m_e_fea_MLPs = nn.ModuleList([MLP(H + H//4, H*4, H, norm=nn.LayerNorm)
+                                                 for _ in range(NUM_MAP_TYPES)])
+            # Agent layer i reads the map as it stood after map layer i-1, so a
+            # map layer after the second-to-last agent layer would feed nothing:
+            # L agent layers need L-1 map layers, and the last of those needs no
+            # m2m edge refresh (no later map layer reads the edges).
+            n_map_layers = max(self.num_of_gnn_layer - 1, 0)
+            self.map_gnns = nn.ModuleList([MapHetGNN(args, update_edges=(i < n_map_layers - 1))
+                                           for i in range(n_map_layers)])
+
+    def _init_map_edges(self, g, etype, fea_name, rel_encoder, mlps, type_lis, map_n_fea):
+        """Initial state of a map-sourced edge: [relative geometry, source shape]."""
+        src, _ = g.edges(etype=etype)
+        rel = rel_encoder(g.edges[etype].data[fea_name])
+        out = torch.zeros((rel.shape[0], self.hidden_dim), device=rel.device)
+        for map_type_index in range(NUM_MAP_TYPES):
+            idx = type_lis[map_type_index]
+            if len(idx) != 0:
+                out[idx] = (mlps[map_type_index](torch.cat([rel[idx], map_n_fea[src[idx]]], dim=-1))).to(out.dtype)
+        return out
+
     def forward(self, input_dic):
+        g = input_dic["graph_lis"]
         agent_n_emb = self.agent_emb(input_dic, self.shared_coor_encoder)
-        agent_n_type_indices = [torch.where((input_dic["graph_lis"].nodes["agent"].data["a_n_type"]) == _) for _ in range(6)]
-        agent_n_fea = torch.zeros((agent_n_emb.shape[0], agent_n_emb.shape[1]), device="cuda:"+str(input_dic["gpu"]))
+        device = agent_n_emb.device
+        agent_n_type_indices = [torch.where((g.nodes["agent"].data["a_n_type"]) == _) for _ in range(6)]
+        agent_n_fea = torch.zeros((agent_n_emb.shape[0], agent_n_emb.shape[1]), device=device)
         for _ in range(6):
-            agent_n_fea[agent_n_type_indices[_]] = self.temporal_encoders[_](agent_n_emb[agent_n_type_indices[_]])
+            agent_n_fea[agent_n_type_indices[_]] = (self.temporal_encoders[_](agent_n_emb[agent_n_type_indices[_]])).to(agent_n_fea.dtype)
 
         agent_edge_types = [('agent', 'self', 'agent'), ('agent', 'other', 'agent')]
         agent_edge_names = ["self", "other"]
 
-        agent_e_type_lis = torch.cat([input_dic["graph_lis"].edata["a_e_type"][_] for _ in agent_edge_types], dim=0)
-        agent_e_fea_rel_pos = torch.cat([input_dic["graph_lis"].edata["a_e_fea"][_] for _ in agent_edge_types], dim=0)
+        # Per-etype access: with map edges in the graph, g.edata[...] would
+        # only list the etypes that happen to carry the feature.
+        agent_e_type_lis = torch.cat([g.edges[_].data["a_e_type"] for _ in agent_edge_types], dim=0)
+        agent_e_fea_rel_pos = torch.cat([g.edges[_].data["a_e_fea"] for _ in agent_edge_types], dim=0)
         agent_e_type_indices = [torch.where(agent_e_type_lis == _) for _ in range(6)]
-        agent_e_src_n_fea = torch.cat([agent_n_fea[input_dic["graph_lis"].edges(etype=_)[0],...] for _ in agent_edge_names], dim=0)
+        agent_e_src_n_fea = torch.cat([agent_n_fea[g.edges(etype=_)[0],...] for _ in agent_edge_names], dim=0)
         agent_e_fea_rel_pos = self.shared_rel_encoder(agent_e_fea_rel_pos)
-        agent_e_fea = torch.zeros((agent_e_fea_rel_pos.shape[0], self.hidden_dim), device="cuda:"+str(input_dic["gpu"]))
+        agent_e_fea = torch.zeros((agent_e_fea_rel_pos.shape[0], self.hidden_dim), device=device)
         for _ in range(6):
-            agent_e_fea[agent_e_type_indices[_]] = self.agent_e_fea_MLPs[_](torch.cat([agent_e_fea_rel_pos[agent_e_type_indices[_]], agent_e_src_n_fea[agent_e_type_indices[_]]], dim=-1))
-        input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"] = agent_n_fea
-        agent_e_num_lis_by_etype = np.cumsum([0] + [len(input_dic["graph_lis"].edges[_].data["a_e_type"]) for _ in agent_edge_types])
+            agent_e_fea[agent_e_type_indices[_]] = (self.agent_e_fea_MLPs[_](torch.cat([agent_e_fea_rel_pos[agent_e_type_indices[_]], agent_e_src_n_fea[agent_e_type_indices[_]]], dim=-1))).to(agent_e_fea.dtype)
+        g.nodes["agent"].data["a_n_hidden"] = agent_n_fea
+        agent_e_num_lis_by_etype = np.cumsum([0] + [len(g.edges[_].data["a_e_type"]) for _ in agent_edge_types])
         for _index, _ in enumerate(agent_edge_types):
-            input_dic["graph_lis"].edges[_].data["a_e_hidden"] = agent_e_fea[agent_e_num_lis_by_etype[_index]:agent_e_num_lis_by_etype[_index+1]]
+            g.edges[_].data["a_e_hidden"] = agent_e_fea[agent_e_num_lis_by_etype[_index]:agent_e_num_lis_by_etype[_index+1]]
+
+        if self.use_map:
+            m_n_type_lis = input_dic["m_n_type_lis"]
+            m_n_fea_in = g.nodes["map"].data["m_n_fea"]
+            map_n_fea = torch.zeros((m_n_fea_in.shape[0], self.hidden_dim), device=device)
+            for map_type_index in range(NUM_MAP_TYPES):
+                idx = m_n_type_lis[map_type_index]
+                if len(idx) != 0:
+                    map_n_fea[idx] = (self.map_emb[map_type_index](m_n_fea_in[idx])).to(map_n_fea.dtype)
+            g.nodes["map"].data["m_n_hidden"] = map_n_fea
+            g.edges["m2a"].data["m2a_e_hidden"] = self._init_map_edges(
+                g, "m2a", "m2a_e_fea", self.m2a_rel_encoder, self.m2a_e_fea_MLPs,
+                input_dic["a_e_type_dict"]["m2a"], map_n_fea)
+            g.edges["m2m"].data["m2m_e_hidden"] = self._init_map_edges(
+                g, "m2m", "m2m_e_fea", self.m2m_rel_encoder, self.m2m_e_fea_MLPs,
+                input_dic["a_e_type_dict"]["m2m"], map_n_fea)
 
         for i in range(self.num_of_gnn_layer):
+            # Both read layer i-1 states, then both are written: a synchronous update.
             output_agent_n_fea, output_in_agent_e_fea = self.agent_gnns[i](input_dic)
-            input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"] = output_agent_n_fea
-            input_dic["graph_lis"].edges["self"].data["a_e_hidden"] = output_in_agent_e_fea[0]
-            input_dic["graph_lis"].edges["other"].data["a_e_hidden"] = output_in_agent_e_fea[1]
-        return input_dic["graph_lis"]
+            run_map = self.use_map and i < len(self.map_gnns)
+            if run_map:
+                output_map_n_fea, output_m2m_e_fea = self.map_gnns[i](input_dic)
+            g.nodes["agent"].data["a_n_hidden"] = output_agent_n_fea
+            g.edges["self"].data["a_e_hidden"] = output_in_agent_e_fea[0]
+            g.edges["other"].data["a_e_hidden"] = output_in_agent_e_fea[1]
+            if self.use_map:
+                g.edges["m2a"].data["m2a_e_hidden"] = output_in_agent_e_fea[2]
+            if run_map:
+                g.nodes["map"].data["m_n_hidden"] = output_map_n_fea
+                g.edges["m2m"].data["m2m_e_hidden"] = output_m2m_e_fea
+        return g
 
 
 # =============================================================================
@@ -903,7 +1223,8 @@ class TransformerDiffusionDecoder(nn.Module):
 
         return (x_t - sqrt_one_minus_alpha_cumprod_t * noise) / sqrt_alpha_cumprod_t
 
-    def training_forward(self, agent_features, agent_ids, agent_types, labels, goal_pos, input_dic):
+    def training_forward(self, agent_features, agent_ids, agent_types, labels, goal_pos, input_dic,
+                         map_geom=None, map_mask=None):
         """Training forward pass with noise prediction and alpha_t-weighted goal loss.
 
         The model predicts noise (epsilon). For the goal penalty, we recover
@@ -911,6 +1232,12 @@ class TransformerDiffusionDecoder(nn.Module):
         cumsum, and compare the final position to the goal. The penalty is
         weighted by alpha_t so it only applies at low noise levels where x0
         recovery is accurate.
+
+        With map_geom / map_mask (--diffusion_map_penalty), the same recovered
+        path is also charged the depth of each of its points inside a shape the
+        agent may not enter (densified, so a step cannot jump a thin shape),
+        alpha_t-weighted for the same reason. Returns (predicted_noise, noise,
+        goal_penalty, map_penalty), map_penalty 0 without map_geom.
         """
         device = agent_features.device
         batch_size = agent_features.shape[0]
@@ -935,7 +1262,13 @@ class TransformerDiffusionDecoder(nn.Module):
         alpha_t = self.schedule.alphas_cumprod[t].unsqueeze(-1)  # (batch, 1)
         goal_penalty = torch.mean(alpha_t * (final_pos - goal_pos) ** 2)
 
-        return predicted_noise, noise, goal_penalty
+        if map_geom is not None:
+            depth = map_depth(densify_path(predicted_positions), map_geom, map_mask)   # (batch, 2T)
+            map_penalty = torch.mean(alpha_t.squeeze(-1) * depth.mean(dim=-1))
+        else:
+            map_penalty = torch.zeros((), device=device)
+
+        return predicted_noise, noise, goal_penalty, map_penalty
 
     @torch.no_grad()
     def ddim_sample(self, agent_features, agent_ids, agent_types, goal_pos, input_dic, num_samples=None, ddim_steps=20):
@@ -1242,6 +1575,27 @@ class HDGT_model(nn.Module):
         self.conf_sharpen = getattr(args, 'conf_sharpen', 1.0)
         self.conf_goal_blend = getattr(args, 'conf_goal_blend', 0.5)
 
+        # Map penalties, each optional and off by default: the map reaches the
+        # model through the graph only (HDGT_encoder). Switched on, each point of
+        # a goal or path inside a shape its agent may not enter costs its depth
+        # there (map_depth: linear, 0 outside), times a weight in [0, 1]. With
+        # --map_penalty_gt_exempt (default), shapes the agent's own GT path enters
+        # are left out for that agent, so a penalty never pushes against the GT.
+        self.goal_map_penalty = flag_on(getattr(args, 'goal_map_penalty', False))
+        self.diffusion_map_penalty = flag_on(getattr(args, 'diffusion_map_penalty', False))
+        self.refiner_map_penalty = flag_on(getattr(args, 'refiner_map_penalty', False))
+        self.goal_map_penalty_weight = float(getattr(args, 'goal_map_penalty_weight', 0.1))
+        self.diffusion_map_penalty_weight = float(getattr(args, 'diffusion_map_penalty_weight', 0.1))
+        self.refiner_map_penalty_weight = float(getattr(args, 'refiner_map_penalty_weight', 0.1))
+        for part in ("goal", "diffusion", "refiner"):
+            weight = getattr(self, f"{part}_map_penalty_weight")
+            if not 0.0 <= weight <= 1.0:
+                raise ValueError(f"--{part}_map_penalty_weight must be in [0, 1], got {weight}")
+        if self.refiner_map_penalty and not self.use_refiner:
+            raise ValueError("--refiner_map_penalty needs the refiner (--use_refiner True)")
+        self.map_penalty_gt_exempt = flag_on(getattr(args, 'map_penalty_gt_exempt', True))
+        self.last_map_penalties = {}     # the switched-on penalties of the last training batch
+
         # Model components
         self.encoder = HDGT_encoder(input_dim, args)
         self.diffusion_decoder = TransformerDiffusionDecoder(args)
@@ -1324,6 +1678,18 @@ class HDGT_model(nn.Module):
             labels_pos = input_dic["label_pos_lis"]  # positions for refiner
             gt_goal = input_dic["goal_pos_lis"]      # GT goal endpoint (regressor target)
 
+            # Map penalties (each off by default): the shapes each target may not
+            # enter, in its own frame, for the switched-on penalties only
+            zero = torch.zeros((), device=labels_pos.device)
+            goal_map_loss = diffusion_map_loss = refiner_map_loss = zero
+            map_geom = map_mask = None
+            if self.goal_map_penalty or self.diffusion_map_penalty or self.refiner_map_penalty:
+                if "map_geom_lis" not in input_dic:
+                    raise ValueError("a map penalty is on but the batch has no map: it needs --use_map True")
+                map_geom = input_dic["map_geom_lis"]
+                map_mask = input_dic["map_loss_mask_lis" if self.map_penalty_gt_exempt
+                                     else "map_forbid_mask_lis"]
+
             # ─────────────────────────────────────────────────────────────
             # LOSS 3: Multimodal Goal Predictor (K-head Winner-Takes-All)
             # ─────────────────────────────────────────────────────────────
@@ -1358,6 +1724,9 @@ class HDGT_model(nn.Module):
             # (pixel RMSE = sqrt(value) * 50). Occupies the old goal_recon slot.
             goal_recon_loss = goal_dists.gather(1, winner_idx.unsqueeze(1)).mean().detach()
 
+            if self.goal_map_penalty:     # every head's goal point, inside a forbidden shape
+                goal_map_loss = map_depth(predicted_goals, map_geom, map_mask).mean()
+
             # Goal curriculum, two forms:
             # (a) winner blend (N, 2) for the diffusion noise-prediction loss —
             #     the GT trajectory's endpoint ~= winner goal, so conditioning
@@ -1381,13 +1750,15 @@ class HDGT_model(nn.Module):
             # ─────────────────────────────────────────────────────────────
             # LOSS 1: Noise prediction + alpha_t-weighted goal penalty
             # ─────────────────────────────────────────────────────────────
-            predicted_noise, actual_noise, goal_penalty = self.diffusion_decoder.training_forward(
+            predicted_noise, actual_noise, goal_penalty, diffusion_map_loss = self.diffusion_decoder.training_forward(
                 target_agent_features,
                 target_agent_ids,
                 target_agent_types,
                 labels_vel,
                 effective_goal,
-                input_dic
+                input_dic,
+                map_geom=map_geom if self.diffusion_map_penalty else None,
+                map_mask=map_mask,
             )
             diffusion_loss = F.mse_loss(predicted_noise, actual_noise) + goal_penalty
 
@@ -1439,6 +1810,10 @@ class HDGT_model(nn.Module):
                 # goal. The goal still conditions the refiner as an input; we just don't
                 # add a separate penalty that would fight the GT supervision.
                 refiner_loss = best_mode_distances.mean()
+
+                if self.refiner_map_penalty:   # every refined chain, densified
+                    refiner_map_loss = map_depth(
+                        densify_path(all_refined_steps[:, -1]), map_geom, map_mask).mean()
 
                 # ─────────────────────────────────────────────────────────
                 # LOSS 4: scorer — rank the chains we actually select from
@@ -1501,11 +1876,20 @@ class HDGT_model(nn.Module):
             # scorer_term is kept out of goal_loss on purpose: every scorer
             # input is detached, so this term can only move the scorer's weights.
             # Nothing it does can degrade the goal predictor or the generator.
+            # Switched-off map penalties are 0 here, so they add nothing
+            map_term = (self.goal_map_penalty_weight * goal_map_loss +
+                        self.diffusion_map_penalty_weight * diffusion_map_loss +
+                        self.refiner_map_penalty_weight * refiner_map_loss)
+            self.last_map_penalties = {part: value.detach() for part, value, on in (
+                ("goal", goal_map_loss, self.goal_map_penalty),
+                ("diffusion", diffusion_map_loss, self.diffusion_map_penalty),
+                ("refiner", refiner_map_loss, self.refiner_map_penalty)) if on}
             total_loss = (
                 self.diffusion_loss_weight * diffusion_loss +
                 self.refiner_loss_weight * refiner_loss +
                 self.goal_loss_weight * goal_loss +
-                scorer_term
+                scorer_term +
+                map_term
             )
 
             return total_loss, diffusion_loss, refiner_loss, goal_loss, goal_recon_loss, pred_indice_bool_type_lis, target_agent_types
