@@ -1,27 +1,11 @@
 """
-model.py  (hdgt_map_gnn)
+model.py
 ========
-
-hdgt_goal plus the scene map, which reaches the model THROUGH THE GRAPH ONLY.
-Grass and obstacle shapes (sdd/shapes, drawn with draw_shapes.py) are "map"
-nodes; map->map edges link nearby shapes and map->agent edges link each agent to
-the shapes near it. In every GNN layer each agent attends to its agent
-neighbours and, separately, to its nearby shapes (AgentHetGNN), and the shapes
-update over each other (MapHetGNN). The map thereby shapes the 256-D agent
-embedding that the goal predictor, the diffusion decoder and the refiner read;
-nothing else sees the map. Those three modules, the scorers and every loss are
-hdgt_goal's, unchanged.
-
-Optional map penalties, each off by default and weighted in [0, 1]
-(--goal_map_penalty, --diffusion_map_penalty, --refiner_map_penalty): a point of
-a predicted goal or path inside a shape its agent may not enter (obstacles for
-every agent, grass for every agent but pedestrians) costs its depth inside,
-linearly (see map_depth); a point outside costs nothing.
 
 Self-contained copy of the full HDGT model in which the goal predictor is a
 **multimodal K-head Winner-Takes-All (MTP-style) predictor** `GoalPredictorMTP`:
 
-    agent_features (N, hidden) -> K candidate goals (N, K, 2) + confidences (N, K)
+    agent_features (N, hidden) -> K candidate goals (N, K, 2)
 
 with K = args.num_prediction (= number of DDIM chains), so each diffusion chain
 is conditioned on its OWN goal mode at inference. Multimodality comes from the
@@ -30,18 +14,32 @@ gradient, so heads specialize into distinct modes), NOT from a latent — there 
 no KL and posterior collapse is structurally impossible.
 
 Loss = WTA regression (relaxed top-3 during the curriculum ramp, annealing to
-top-1); without a scorer, + 0.5 * cross-entropy on the winner index (trains the
-confidence head).
+top-1).
 
-Ranking the K refined chains (index 0 is what single-trajectory metrics read):
-  - --scorer_type mode: ModeScorer, hand-made geometric features of each chain
-  - --scorer_type traj: TrajScorer, the raw chains with attention across them
-    and to the neighbours
-  - --use_scorer False: no scorer; the model is just goal-aware and behaves
-    like hdgt_goal_WTA_regressor (confidence head trained, chains left in the
-    goal heads' order)
-The scorer's loss (weight --scorer_loss_weight) starts once the goal curriculum
-is done. Every scorer input is detached, so it can only move the scorer.
+The generator (encoder, goal predictor, diffusion decoder, refiner) is the one
+of hdgt_goal. What this version adds is the ranker, TrajRankNN, which orders
+the K refined chains (index 0 is what single-trajectory metrics read) in place
+of hdgt_goal's scorers. It is part of HDGT_model and trains ONLINE with it, on
+the same chains the refiner loss is computed on, to order them by their ADE to
+the ground truth. Its loss (weight --ranker_loss_weight) starts once the goal
+curriculum is done. Every ranker input is detached, so it can only move the
+ranker: minADE / minFDE are the generator's alone.
+
+Map (--use_map, off by default), exactly as hdgt_map_gnn: the scene map reaches
+the model THROUGH THE GRAPH ONLY. Grass and obstacle shapes (sdd/shapes, drawn
+with draw_shapes.py) are "map" nodes; map->map edges link nearby shapes and
+map->agent edges link each agent to the shapes near it. In every GNN layer each
+agent attends to its agent neighbours and, separately, to its nearby shapes
+(AgentHetGNN), and the shapes update over each other (MapHetGNN). The map
+thereby shapes the agent embedding that the goal predictor, the diffusion
+decoder, the refiner and the ranker read; nothing else sees the map. With
+--use_map False every module, parameter and loss is the map-free model's.
+
+Optional map penalties, each off by default, weighted in [0, 1] and needing
+--use_map (--goal_map_penalty, --diffusion_map_penalty, --refiner_map_penalty):
+a point of a predicted goal or path inside a shape its agent may not enter
+(obstacles for every agent, grass for every agent but pedestrians) costs its
+depth inside, linearly (see map_depth); a point outside costs nothing.
 
 Training conditioning:
   - diffusion training_forward: winner goal blended with GT via the curriculum
@@ -800,23 +798,24 @@ class GoalEmbedder(nn.Module):
 
 class GoalPredictorMTP(nn.Module):
     """
-    Multimodal goal predictor (MTP-style): K candidate endpoints + confidences.
+    Multimodal goal predictor (MTP-style): K candidate endpoints.
 
-        agent_features (N, hidden) -> goals (N, K, 2), logits (N, K)
+        agent_features (N, hidden) -> goals (N, K, 2)
 
-    A shared MLP trunk feeds two linear heads. Multimodality is enforced by the
+    An MLP trunk feeds a linear head. Multimodality is enforced by the
     winner-takes-all loss (computed in HDGT_model.forward), which lets each of
     the K heads specialize on a distinct future mode instead of averaging them.
     No latent, no KL — nothing can collapse.
 
-    `with_conf_head` controls the legacy blind confidence head. When the
-    ModeScorer is in use it is built with with_conf_head=False, so the trunk
-    that produces the goals receives gradient ONLY from the WTA regression.
-    That matters: in scaled units the WTA MSE is ~1e-2 while a 20-way
-    cross-entropy is ~2-3, so a conf head on this shared trunk trains the trunk
-    almost entirely for ranking and starves the regression it is sharing.
+    There is no confidence head: ordering the K modes is the ranker's job, done
+    on the finished chains. This is hdgt_goal's predictor as it is built when a
+    scorer ranks the chains (with_conf_head=False there), so the trunk receives
+    gradient ONLY from the WTA regression. That matters: in scaled units the
+    WTA MSE is ~1e-2 while a 20-way cross-entropy is ~2-3, so a conf head on
+    this shared trunk trains the trunk almost entirely for ranking and starves
+    the regression it is sharing.
     """
-    def __init__(self, hidden_dim, num_modes, with_conf_head=True):
+    def __init__(self, hidden_dim, num_modes):
         super().__init__()
         self.num_modes = num_modes
         self.trunk = nn.Sequential(
@@ -826,166 +825,567 @@ class GoalPredictorMTP(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.goal_head = nn.Linear(hidden_dim, num_modes * 2)
-        self.conf_head = nn.Linear(hidden_dim, num_modes) if with_conf_head else None
 
     def forward(self, agent_features):
         h = self.trunk(agent_features)
         goals = self.goal_head(h).view(-1, self.num_modes, 2)  # (N, K, 2)
-        logits = self.conf_head(h) if self.conf_head is not None else None  # (N, K)
-        return goals, logits
+        return goals
 
 
-class ModeScorer(nn.Module):
+# =============================================================================
+# RankNN — the ranker over the K generated chains
+#
+# Adapted from the RankNN of "Heteroscedastic Diffusion for Multi-Agent
+# Trajectory Modeling" (U2Diff). It stands where hdgt_goal's ModeScorer and
+# TrajScorer stood. Built inside HDGT_model and trained ONLINE with the
+# generator: every training step it ranks the K refined chains the refiner loss
+# was computed on, read detached, by their ADE to the ground truth
+# (HDGT_model._rank_chains).
+#
+# Four differences from the paper, each forced by this setting:
+#   - a mode here is one chain for ONE agent, not a whole scene: the generator
+#     samples agents independently, so bundling chain k across agents would be
+#     inventing a correlation that does not exist;
+#   - the temporal encoder is a bi-GRU over T=12, not a Mamba over T=50;
+#   - social context enters by cross-attention to neighbour tokens, because the
+#     agent axis is the batch axis here rather than an axis inside a mode;
+#   - the K axis gets a LEARNED SLOT EMBEDDING, which the paper deliberately
+#     omits. Their modes are i.i.d. draws and genuinely exchangeable. Here chain
+#     k is bound to goal head k and to modal_emb[k] in DiffusionRefiner, and
+#     refiner_loss supervises only the winning chain, so slot quality is
+#     systematically uneven. ModeScorer is permutation-equivariant and therefore
+#     cannot represent that at all; this can.
+#
+# The paper's uncertainty channels (bivariate NLL, Cholesky head, Reverse
+# Gaussian Sampling, Jacobian propagation) are NOT implemented. Their own
+# ablation puts that machinery last by contribution, and two free proxies stand
+# in for it: how hard the refiner had to drag a chain, and whether DDIM had
+# settled when sampling ended.
+# =============================================================================
+
+_RANK_EPS = 1e-6
+# A parked car has |v0| ~ 1e-4 in scaled units, and 37% of the test split is
+# near-stationary cars. An epsilon in the denominator alone still lets the seam
+# ratio reach 1e4 and swamp every other channel after normalisation, so the
+# ratio itself is clamped.
+_SEAM_RATIO_MAX = 10.0
+
+
+def _within_std(x, dim):
+    """Standardise each channel across `dim` (the K axis), per agent.
+
+    Makes a feature answer "how does this candidate compare to its siblings",
+    which is scale-free and is the question a ranker is actually asked. An agent
+    whose candidates are all identical gives 0 rather than NaN.
     """
-    Permutation-equivariant scorer over the K generated candidates.
+    m = x.mean(dim=dim, keepdim=True)
+    s = x.std(dim=dim, keepdim=True).clamp_min(1e-4)
+    return (x - m) / s
 
-    Replaces the blind `conf_head`, which had three defects:
-      1. it was trained on the GOAL winner (argmin |g_k - gt_goal|) but used at
-         inference to rank TRAJECTORIES — and chain k drifts from goal k, has
-         its own DDIM seed, and argmin-FDE != argmin-ADE;
-      2. logit k was `u_k . h + d_k`, so it never saw the candidate it scores;
-         slot k had to be recognised by a slot-specific linear detector even
-         though slot semantics drift across agent types and speeds;
-      3. hard cross-entropy over ~5 near-tied plausible modes converges to the
-         posterior (~0.2 each), so the top of the ranking is decided by noise.
 
-    Here every mode is scored from its OWN content with weights SHARED across
-    modes, and a Deep-Sets mean-subtraction couples the modes so the score is
-    comparative — ranking is inherently a relative judgement. Two outputs:
+def _rank_safe_norm(x, dim=-1, keepdim=False):
+    return x.norm(dim=dim, keepdim=keepdim).clamp_min(_RANK_EPS)
 
-        logit_k   -> softmax ranking, trained on the trajectory winner
-        log_err_k -> predicted log ADE of chain k, trained on ALL K modes
 
-    The regression head is what gives every mode a gradient (cross-entropy only
-    ever supervises one) and what gives an ABSOLUTE, calibrated score; a softmax
-    over K is relative-within-agent by construction and cannot provide one.
+def _rank_cos(a, b):
+    """Cosine between two vector fields, safe and in-domain for acos."""
+    return ((a * b).sum(-1) / (_rank_safe_norm(a) * _rank_safe_norm(b))).clamp(-1.0, 1.0)
 
-    Every input is detached: this module cannot move the encoder, the goal
-    predictor, the denoiser or the refiner.
+
+def build_rank_features(trajs, goals, obs, refine_delta=None, settle=None):
+    """Features for TrajRankNN, in SLOT order.
+
+    ONE implementation, shared by training and inference (both through
+    HDGT_model._rank_chains). Any divergence between those two paths would be
+    a silent bug, so there is deliberately no second copy.
+
+    Args (agent-local scaled frame):
+        trajs        (N, K, T, 2) refined candidate POSITIONS, relative to last obs
+        goals        (N, K, 2)    candidate goals
+        obs          (N, obs_len, 2) observed positions
+        refine_delta (N, K, R)    per-refinement-step displacement, or None
+        settle       (N, K, S)    per-DDIM-step movement near the end, or None
+    Returns:
+        state (N, K, T, 8), geom (N, K, 19 + S + 4)
+        (the trailing 4 are per-agent kinematics, identical across K)
+
+    The geometry block carries BOTH the features ModeScorer had (path length,
+    spread) and the features that can contradict them (seam continuity,
+    curvature, deviation from constant velocity). The old scorer could only see
+    the first group, so if it learned "longer and curvier is better" it had
+    nothing available to argue the other way.
+    """
+    n, k, t, _ = trajs.shape
+    dt, dev = trajs.dtype, trajs.device
+
+    # ---- intermediates ----------------------------------------------------
+    v0 = obs[:, -1, :] - obs[:, -2, :]                       # (N,2) last observed velocity
+    idx = torch.arange(1, t + 1, device=dev, dtype=dt)
+    ballistic_path = v0[:, None, None, :] * idx[None, None, :, None]   # (N,1,T,2)
+    consensus_path = trajs.mean(dim=1, keepdim=True)         # (N,1,T,2)
+    goal_consensus = goals.mean(dim=1, keepdim=True)         # (N,1,2)
+
+    # first step is measured from the origin: last observed position is 0 here
+    prev = torch.cat([torch.zeros_like(trajs[:, :, :1, :]), trajs[:, :, :-1, :]], dim=2)
+    step_vel = trajs - prev                                  # (N,K,T,2)
+
+    d_consensus = (trajs - consensus_path).norm(dim=-1)      # (N,K,T)
+    d_ballistic = (trajs - ballistic_path).norm(dim=-1)      # (N,K,T)
+    cum_len = step_vel.norm(dim=-1).cumsum(dim=-1)           # (N,K,T)
+
+    if refine_delta is None:
+        refine_delta = torch.zeros(n, k, 5, device=dev, dtype=dt)
+    if settle is None:
+        settle = torch.zeros(n, k, 5, device=dev, dtype=dt)
+    refine_total = refine_delta.sum(-1)                      # (N,K)
+
+    # ---- per-state channels (8) ------------------------------------------
+    # Channel 5 is a per-timestep minimum-Bayes-risk signal: distance to the
+    # centre of mass of all K candidates is a strong unsupervised predictor of
+    # which candidate is right.
+    state = torch.cat([
+        trajs,                                        # 1-2 position
+        step_vel,                                     # 3-4 step velocity
+        d_consensus.unsqueeze(-1),                    # 5   distance to consensus
+        d_ballistic.unsqueeze(-1),                    # 6   distance to constant velocity
+        cum_len.unsqueeze(-1),                        # 7   path length so far
+        refine_total[..., None, None].expand(n, k, t, 1),   # 8 refiner effort
+    ], dim=-1)
+
+    # ---- per-mode scalars (19 + S) ---------------------------------------
+    end = trajs[:, :, -1, :]
+    ballistic_end = (v0 * float(t))[:, None, :]
+
+    seam_cos = _rank_cos(step_vel[:, :, 0, :], v0[:, None, :]).unsqueeze(-1)
+    seam_ratio = (_rank_safe_norm(step_vel[:, :, 0, :]) / _rank_safe_norm(v0)[:, None]
+                  ).clamp(max=_SEAM_RATIO_MAX).unsqueeze(-1)
+
+    turn = torch.acos(_rank_cos(step_vel[:, :, 1:, :], step_vel[:, :, :-1, :]))
+
+    # ---- per-AGENT kinematic scalars (4), broadcast over K -----------------
+    # These replace the 256-d encoder feature the ranker used to receive. That
+    # feature was unique per agent-window and let the network memorise "this
+    # agent -> that slot" on the train cache (train loss fell, val top-1 ADE
+    # rose after epoch 4). What a ranker legitimately needs from the past is
+    # coarse and shared by thousands of agents: how fast, how straight, how
+    # steady. Four numbers carry that; none of them can single out an agent.
+    obs_vel = obs[:, 1:, :] - obs[:, :-1, :]                 # (N, obs_len-1, 2)
+    obs_speed = obs_vel.norm(dim=-1)                         # (N, obs_len-1)
+    speed0 = obs_speed[:, -1:]                               # last observed speed
+    obs_accel = obs_speed[:, -1:] - obs_speed[:, :1]         # speed change over the window
+    obs_turn = torch.acos(_rank_cos(obs_vel[:, 1:, :], obs_vel[:, :-1, :])).mean(
+        dim=-1, keepdim=True)                                # mean heading change
+    obs_straight = ((obs[:, -1, :] - obs[:, 0, :]).norm(dim=-1, keepdim=True)
+                    / obs_speed.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                    ).clamp(max=1.0)                         # chord / arc, 1 = straight
+    kin = torch.cat([speed0, obs_accel, obs_turn, obs_straight], dim=-1)   # (N,4)
+    kin = kin[:, None, :].expand(n, k, 4)
+
+    geom = torch.cat([
+        goals,                                              # 1-2   intended endpoint
+        goals - goal_consensus,                             # 3-4   deviation from consensus
+        goals - ballistic_end,                              # 5-6   deviation from const-vel
+        end,                                                # 7-8   realised endpoint
+        end - goals,                                        # 9-10  goal drift
+        (goals - goal_consensus).norm(dim=-1, keepdim=True),  # 11  spread
+        cum_len[:, :, -1:],                                 # 12    total path length
+        seam_cos,                                           # 13    direction continuity
+        seam_ratio,                                         # 14    speed continuity
+        turn.mean(-1, keepdim=True),                        # 15    mean curvature
+        turn.max(-1).values.unsqueeze(-1),                  # 16    worst kink
+        d_ballistic.mean(-1, keepdim=True),                 # 17    whole-path const-vel dev
+        d_consensus.mean(-1, keepdim=True),                 # 18    medoid score
+        refine_total.unsqueeze(-1),                         # 19    refiner effort
+        settle,                                             # 20..  DDIM convergence
+        kin,                                                # last 4: agent kinematics
+    ], dim=-1)
+
+    return state, geom
+
+
+class TrajRankNN(nn.Module):
+    """Reranks the K chains of one agent. Two outputs, both (N, K):
+
+        err_score -- what you SORT BY, ASCENDING. Low is good. It is an error
+                     magnitude, the analogue of the paper's error probability.
+                     Sorting it descending inverts the ranker completely and
+                     looks exactly like a training failure, so the direction is
+                     asserted in one place: HDGT_model.forward.
+        log_ade   -- auxiliary absolute magnitude. A within-agent ranking is
+                     relative by construction and cannot say whether ALL K
+                     candidates are bad; this head can, and it gives every one
+                     of the K modes a gradient rather than just the winner.
+
+    Shape of the funnel, following the paper: describe each candidate on its
+    own, then compare them against each other.
     """
 
-    # per-mode features: goal(2) + goal-consensus(2) + goal-ballistic(2)
-    #                    + endpoint(2) + drift(2) + spread(1) + path length(1)
-    N_GEOM = 12
-
-    def __init__(self, hidden_dim, pred_len, d_model=64, dropout=0.0):
+    def __init__(self, hidden_dim, pred_len, K, n_state=8, n_geom=28,
+                 d=64, n_heads=4, n_mode_layers=2, n_types=6, dropout=0.2,
+                 within_norm=False, norm_momentum=0.01):
         super().__init__()
-        self.pred_len = pred_len
-        n_in = self.N_GEOM + 2 * pred_len          # + the path shape
-        self.in_proj = nn.Linear(n_in, d_model)
-        self.ctx_proj = nn.Linear(hidden_dim, d_model)
-        self.mix = nn.Linear(2 * d_model, d_model)
-        self.out_proj = nn.Linear(d_model, 2)      # [logit, log_err]
-        # Dropout on the two hidden layers (--scorer_dropout); none by default
-        self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        # hidden_dim is kept ONLY for ctx_proj (the neighbour tokens are encoder
+        # features of that width). The agent's OWN encoder feature is no longer
+        # an input — see the note above feat_proj's former position below.
+        #
+        # dropout default raised 0.1 -> 0.2 and applied at four more places
+        # (inputs, geometry MLP, pooled candidate embedding, head). Measured
+        # on the 30-epoch run: train loss fell monotonically 2.07 -> 1.68 while
+        # val top-1 ADE got WORSE from epoch 4 on (18.8 -> 21.0 px). The model
+        # was fitting the train cache, not the ranking problem. Weight decay is
+        # raised to match (1e-4 -> 1e-2, train.py --ranker_weight_decay).
+        # within_norm doubles the input width: each channel enters twice, once
+        # globally normalised and once standardised across the agent's K.
+        #
+        # DEFAULT OFF because it was MEASURED NOT TO HELP on this data. The idea
+        # was that global stats would crush within-agent variation, but on real
+        # candidates the median within/global std ratio is 0.711, not the ~0.05
+        # the hypothesis predicted, so the features were never starved. The A/B
+        # at 8 epochs: off closes 62.8% of the gap, on closes 61.9%. Kept as an
+        # option for ablation, not because the feature earns its place.
+        self.within_norm = within_norm
+        mult = 2 if within_norm else 1
+        self.K, self.d = K, d
 
-    @staticmethod
-    def build_features(goals, trajs, obs_traj, pred_len):
+        # Normalisation buffers. Registered rather than stored loose so they
+        # travel with the checkpoint and are provably identical between
+        # training and inference. Raw channel scales run from curvature in
+        # radians to positions in scaled units, so without this the input layer
+        # is dominated by whichever channel happens to be largest. Tracked from
+        # every training batch by _track_norm_stats, because the chains being
+        # ranked keep changing while the generator trains, and statistics
+        # fixed at any one moment would go stale.
+        self.register_buffer("state_mean", torch.zeros(n_state))
+        self.register_buffer("state_std", torch.ones(n_state))
+        self.register_buffer("geom_mean", torch.zeros(n_geom))
+        self.register_buffer("geom_std", torch.ones(n_geom))
+        self.norm_momentum = norm_momentum
+        self.register_buffer("norm_batches", torch.zeros((), dtype=torch.long))
+
+        # Input dropout on the normalised feature channels. Zeroing a random
+        # subset of the 8 + 24 channels per forward stops the network from
+        # leaning on any single one (spread, path length, one settle step) and
+        # forces it to read the candidate from several angles.
+        self.in_drop = nn.Dropout(dropout)
+
+        # stage one, part A: the path itself, read in time order. ModeScorer
+        # flattened T x 2 into one linear layer, which throws away exactly the
+        # structure this encoder exists to capture.
+        self.state_proj = nn.Linear(n_state * mult, d)
+        self.gru = nn.GRU(d, d // 2, batch_first=True, bidirectional=True)
+
+        # stage one, part B: the per-mode scalars
+        self.geom_mlp = nn.Sequential(
+            nn.Linear(n_geom * mult, d), nn.ReLU(inplace=True),
+            nn.Dropout(dropout), nn.Linear(d, d))
+
+        # dropout on the pooled per-candidate embedding, before identity terms
+        # and context are added and before the K candidates compare themselves
+        self.cand_drop = nn.Dropout(dropout)
+
+        # identity terms: which slot and what kind of agent.
+        #
+        # REMOVED: feat_proj(agent_feat), the agent's own 256-d encoder feature.
+        # It was the memorisation channel. Every agent-window has a unique
+        # feature vector, so it works as an ID, and the train cache holds ~19k
+        # agents x 3 draws: the cheapest way to lower the loss is "for THIS
+        # vector, slot 4 wins", which generalises to nothing. That is exactly
+        # the pattern in the training log (train loss down, val top-1 up after
+        # epoch 4). The kinematic facts that feature carried and that a ranker
+        # legitimately needs -- how fast the agent was going, whether it was
+        # turning or accelerating -- now enter as four explicit scalars in
+        # build_rank_features (geometry channels 25-28), which are shared by
+        # many agents and cannot identify one.
+        self.slot_emb = nn.Parameter(torch.randn(K, d) * 0.02)
+        self.type_emb = nn.Embedding(n_types, d)
+
+        # social conditioning: each candidate attends to the neighbour tokens
+        self.ctx_proj = nn.Linear(hidden_dim, d)
+        self.ctx_attn = nn.MultiheadAttention(d, n_heads, dropout=dropout,
+                                              batch_first=True)
+        self.ctx_norm = nn.LayerNorm(d)
+
+        # stage two: compare the K candidates. This is where ranking happens,
+        # because "is this candidate good" is only answerable relative to its
+        # siblings. Strictly more expressive than ModeScorer's mean-subtraction.
+        layer = nn.TransformerEncoderLayer(
+            d_model=d, nhead=n_heads, dim_feedforward=4 * d, dropout=dropout,
+            batch_first=True, norm_first=True)
+        self.mode_tf = nn.TransformerEncoder(layer, num_layers=n_mode_layers)
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(d), nn.Linear(d, d), nn.ReLU(inplace=True),
+            nn.Dropout(dropout), nn.Linear(d, 2))
+
+    @torch.no_grad()
+    def _track_norm_stats(self, state, geom):
+        """Fold one training batch into the running normalisation statistics.
+
+        A plain average over the batches seen so far, until that would weigh a
+        batch less than norm_momentum, and an exponential one from there on.
+        The first batches therefore set the scale outright instead of being
+        pulled toward the (0, 1) the buffers start at, and later ones follow
+        the generator's chains as they change. Each batch's variance is pooled
+        with the shift of its mean, so the std is the spread across batches,
+        not the smaller spread inside a single one.
         """
-        Args:
-            goals:    (N, K, 2)  candidate goals, agent frame, scaled
-            trajs:    (N, K, T, 2) candidate POSITIONS, relative to last obs
-            obs_traj: (N, obs_len, 2) observed positions, same frame
-        Returns:
-            (N, K, N_GEOM + 2T) per-mode feature tensor
+        w = (1.0 / (self.norm_batches + 1).float()).clamp_min(self.norm_momentum)
+        for x, mean, std in ((state, self.state_mean, self.state_std),
+                             (geom, self.geom_mean, self.geom_std)):
+            x = x.reshape(-1, x.shape[-1]).float()
+            delta = x.mean(dim=0) - mean
+            var = ((1 - w) * std ** 2 + w * x.var(dim=0, unbiased=False)
+                   + w * (1 - w) * delta ** 2)
+            mean.add_(w * delta)
+            std.copy_(var.sqrt().clamp_min(1e-3))
+        self.norm_batches += 1
+
+    def forward(self, state, geom, agent_types, ctx_tokens=None, ctx_mask=None):
         """
-        n, k, t, _ = trajs.shape
-        v0 = (obs_traj[:, -1, :] - obs_traj[:, -2, :]).unsqueeze(1)   # (N,1,2)
-        ballistic = v0 * float(pred_len)                              # constant-velocity endpoint
-        consensus = goals.mean(dim=1, keepdim=True)                   # (N,1,2)
-        end = trajs[:, :, -1, :]                                      # (N,K,2)
+        state       (N, K, T, n_state)
+        geom        (N, K, n_geom)  -- includes the 4 per-agent kinematic scalars
+                    that replaced the encoder feature (see build_rank_features)
+        agent_types (N,)  ZERO-BASED, 0..5, matching target_agent_types inside
+                    HDGT_model (AGENT_TYPE_NAMES is 1..6). Getting the base
+                    wrong collapses pedestrian onto biker and raises nothing.
+        ctx_tokens  (N, M, hidden_dim) or None
+        ctx_mask    (N, M) bool, True = padding, or None
+        """
+        n, k, t, _ = state.shape
+        assert k <= self.slot_emb.shape[0], (
+            f"ranker was trained for K={self.slot_emb.shape[0]}, got K={k}")
+        # Two views of every channel, concatenated.
+        #
+        # GLOBAL: (x - mean) / std over the training batches. Carries absolute
+        # scale, which the log_ade head needs to say how wrong a chain is in pixels.
+        #
+        # WITHIN-AGENT: standardised across the K axis, per agent. This is the
+        # one that matters for ranking, and it was missing. Global stats are
+        # dominated by differences BETWEEN agents — a parked car's endpoint is
+        # ~0.05 scaled units, a biker's ~6 — so the differences WITHIN one
+        # agent's 20 candidates shrink to a few percent of the normalised scale
+        # (measured on this data: 0.034 for cars, 0.109 for pedestrians). The
+        # first linear layer then sees a large per-agent offset with a tiny
+        # perturbation on top, and the only input still varying across K at full
+        # scale is the slot embedding — which is precisely the best_fixed_slot
+        # rule the network was struggling to beat. Ranking is a within-agent
+        # question, so it gets a within-agent normalisation.
+        if self.training:
+            self._track_norm_stats(state, geom)
+        if self.within_norm:
+            state = torch.cat([(state - self.state_mean) / self.state_std,
+                               _within_std(state, dim=1)], dim=-1)
+            geom = torch.cat([(geom - self.geom_mean) / self.geom_std,
+                              _within_std(geom, dim=1)], dim=-1)
+        else:
+            state = (state - self.state_mean) / self.state_std
+            geom = (geom - self.geom_mean) / self.geom_std
+        state, geom = self.in_drop(state), self.in_drop(geom)
 
-        prev = torch.cat([torch.zeros_like(trajs[:, :, :1, :]), trajs[:, :, :-1, :]], dim=2)
-        path_len = (trajs - prev).norm(dim=-1).sum(dim=-1, keepdim=True)   # (N,K,1)
-        spread = (goals - consensus).norm(dim=-1, keepdim=True)            # (N,K,1)
-        # path shape, endpoint-centred so it carries curvature not position
-        shape = (trajs - end.unsqueeze(2)).reshape(n, k, t * 2)
+        # per-candidate temporal encoding; the K axis folds into the batch so
+        # every candidate is described independently of its siblings
+        h = self.state_proj(state).reshape(n * k, t, self.d)
+        h, _ = self.gru(h)
+        h = h.mean(dim=1).reshape(n, k, self.d)          # mean-pool over time
 
-        return torch.cat([
-            goals,                    # where this mode wants to go
-            goals - consensus,        # how far it sits from the consensus of the K heads
-            goals - ballistic,        # how far it deviates from constant velocity
-            end,                      # where the chain actually ended up
-            end - goals,              # goal-following drift — invisible to the old head
-            spread,
-            path_len,
-            shape,
-        ], dim=-1)
+        h = self.cand_drop(h + self.geom_mlp(geom))
+        h = h + self.slot_emb[None, :k, :]
+        # clamp, NOT clamp_: agent_types is already int64 here, so .long()
+        # returns the very same tensor and an in-place clamp would silently
+        # rewrite the caller's target_agent_types.
+        types = agent_types.long().clamp(0, self.type_emb.num_embeddings - 1)
+        h = h + self.type_emb(types)[:, None, :]
+        # (feat_proj(agent_feat) used to be added here; removed, see __init__)
 
-    def forward(self, agent_features, goals, trajs, obs_traj):
-        feat = self.build_features(
-            goals.detach(), trajs.detach(), obs_traj.detach(), self.pred_len
-        )
-        h = self.drop(torch.relu(self.in_proj(feat) + self.ctx_proj(agent_features.detach()).unsqueeze(1)))
-        pooled = h.mean(dim=1, keepdim=True).expand_as(h)
-        h = self.drop(torch.relu(self.mix(torch.cat([h, pooled], dim=-1))))
-        out = self.out_proj(h)                       # (N, K, 2)
-        return out[..., 0], out[..., 1]              # logits, log_err
+        if ctx_tokens is not None and ctx_tokens.shape[1] > 0:
+            kv = self.ctx_proj(ctx_tokens)
+            # An agent whose every context token is padding would make softmax
+            # produce NaN, so those rows attend to nothing and keep h unchanged.
+            if ctx_mask is not None:
+                all_pad = ctx_mask.all(dim=1)
+                if all_pad.any():
+                    ctx_mask = ctx_mask.clone()
+                    ctx_mask[all_pad, 0] = False
+            attn, _ = self.ctx_attn(h, kv, kv, key_padding_mask=ctx_mask)
+            h = self.ctx_norm(h + attn)
+
+        h = self.mode_tf(h)
+        out = self.head(h)                               # (N, K, 2)
+        return out[..., 0], out[..., 1]                  # err_score, log_ade
 
 
-class TrajScorer(nn.Module):
+# ===========================================================================
+# RankNN loss: soft-pick regret + soft-rank Spearman (+ optional listwise)
+#              + auxiliary magnitude
+#
+# All terms are computed per agent over that agent's K candidates, then
+# aggregated by type. Each term exists to fix a specific defect of the
+# cross-entropy-on-argmin loss that trained ModeScorer.
+# ===========================================================================
+def soft_rank(x, reg=0.1):
+    """Differentiable ranks via pairwise sigmoids: rank_i = sum_j sigmoid((x_i-x_j)/reg).
+
+    O(K^2), which at K=20 is free, and it avoids a torchsort dependency (that
+    package is not installed here and needs a compile step).
+
+    x is STANDARDISED per row first, so `reg` is measured in standard deviations
+    of that row rather than in whatever unit x happens to carry. Without it the
+    same reg means two different things on the two sides of the Spearman loss:
+    ade_k is tens of pixels, so ade/0.1 saturates into hard ranks, while
+    err_score is O(1) and stays soft. Near-ties are then treated as "within 0.1
+    pixels" on one side and "within 0.1 output units" on the other, which is not
+    the same statement. After standardising, both mean "within 0.1 of this
+    agent's own spread", which is what the loss is trying to express.
+
+    Note this does NOT flatten the gradient w.r.t. x. Because the standardised
+    rank is scale-invariant by construction, d(rank)/dx still falls as 1/std, so
+    a network whose outputs spread out gets smaller gradients (measured: 1.8e-3
+    at std 0.1, 6.1e-6 at std 30). That is the correct behaviour — when outputs
+    are far apart, moving one barely changes the ordering — and Adam's
+    per-parameter normalisation absorbs most of it.
     """
-    Candidate-aware confidence scorer (fix 3): ranks the K generated chains.
+    x = (x - x.mean(-1, keepdim=True)) / x.std(-1, keepdim=True).clamp_min(1e-6)
+    d = x.unsqueeze(-1) - x.unsqueeze(-2)          # (..., K, K) x_i - x_j
+    return torch.sigmoid(d / reg).sum(-1)
 
-        logits_k = score(trajectory_k, kinematics, agent features, neighbors)
 
-    Unlike the old blind conf head (K logits from agent features alone, never
-    seeing what it ranked), this scores each candidate explicitly:
-      - per-candidate embedding of the full trajectory + endpoint + ballistic
-        residual (endpoint minus constant-velocity extrapolation = "kinematic
-        surprise" of this candidate)
-      - fused with the agent feature
-      - self-attention ACROSS the K candidates (ranking is relative — letting
-        candidates see each other makes the score listwise)
-      - cross-attention to neighbor context (a chain that cuts through a
-        neighbor can be ranked down)
-    All inputs are detached upstream: confidence never trains the encoder,
-    decoder, or refiner. At inference it scores the refined trajectories; the
-    same module can later score bridge prior means mu_k (they are trajectories
-    too), which keeps it compatible with confidence-modulated tube width.
+def spearman_loss(err_score, ade_k, reg=0.1):
+    """Negative Spearman correlation between predicted and true ordering.
+
+    Replaces cross-entropy on argmin_k ade_k, which had three problems this
+    fixes at once:
+      - only the single winner got a gradient; here ALL K modes do;
+      - over 20 near-duplicate candidates that argmin is largely decided by DDIM
+        seed noise, so it was close to a random label. Ranks move smoothly, so
+        near-ties stop mattering;
+      - correlation is computed WITHIN one agent, so per-agent difficulty
+        cancels out for free. That is also why an absolute log-ADE regression is
+        useless for ranking and is kept only as an auxiliary head.
+
+    Both quantities are low-is-good, so a perfect ranker gives correlation +1
+    and this loss reaches its minimum of -1.
     """
-    def __init__(self, hidden_dim, pred_len, dropout=0.1):
-        super().__init__()
-        d = hidden_dim
-        in_dim = pred_len * 2 + 4  # flat trajectory + endpoint (2) + ballistic residual (2)
-        self.cand_embed = nn.Sequential(
-            nn.Linear(in_dim, d),
-            nn.ReLU(inplace=True),
-            nn.Linear(d, d),
-        )
-        self.agent_proj = nn.Linear(d, d)
-        self.self_norm = nn.LayerNorm(d)
-        self.self_attn = nn.MultiheadAttention(d, 4, dropout=dropout, batch_first=True)
-        self.cross_norm = nn.LayerNorm(d)
-        self.cross_attn = nn.MultiheadAttention(d, 4, dropout=dropout, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
-            nn.SiLU(),
-            nn.Linear(d, d),
-        )
-        self.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1))
+    ra, rb = soft_rank(err_score, reg), soft_rank(ade_k, reg)
+    ra = ra - ra.mean(-1, keepdim=True)
+    rb = rb - rb.mean(-1, keepdim=True)
+    ra = ra / ra.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    rb = rb / rb.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return -(ra * rb).sum(-1)                      # (N,) one per agent
 
-    def forward(self, traj, v0, agent_feat, context, context_mask):
-        """
-        traj: (N, K, T, 2) candidate POSITION trajectories (agent frame, scaled)
-        v0:   (N, 2) last observed per-frame velocity
-        agent_feat: (N, H); context: (N, C, H); context_mask: (N, C) bool or None
-        returns logits (N, K)
-        """
-        N, K, T, _ = traj.shape
-        endpoint = traj[:, :, -1, :]                        # (N, K, 2)
-        ballistic = endpoint - (T * v0).unsqueeze(1)        # (N, K, 2)
-        x = torch.cat([traj.reshape(N, K, T * 2), endpoint, ballistic], dim=-1)
-        h = self.cand_embed(x) + self.agent_proj(agent_feat).unsqueeze(1)
-        hn = self.self_norm(h)
-        a, _ = self.self_attn(hn, hn, hn)
-        h = h + a
-        a, _ = self.cross_attn(self.cross_norm(h), context, context,
-                               key_padding_mask=context_mask)
-        h = h + a
-        h = h + self.ffn(h)
-        return self.out(h).squeeze(-1)                      # (N, K)
+
+def topk_listwise_loss(err_score, ade_k, k_top=3, tau=5.0):
+    """Truncated Plackett-Luce over the first k_top positions.
+
+    Spearman weights every pair equally, but getting rank 19 right against rank
+    20 is worth nothing for top-1 selection. This concentrates the gradient
+    where the reported metric actually reads.
+
+    tau is in PIXELS, matching ade_k. This matters: the reference spec set
+    tau=0.1, which is a scaled-unit value. At pixel scale the soft target
+    collapses to one-hot (effective support 1.00 of 20), which would silently
+    restore the hard-argmin-on-seed-noise target this loss exists to avoid. At
+    tau=5 px the support is about 6 of 20, which is genuinely soft.
+    """
+    target = F.softmax(-ade_k / tau, dim=-1)
+    scores = -err_score                            # high = good, for log_softmax
+    loss = torch.zeros(err_score.shape[0], device=err_score.device)
+    masked = scores
+    avail = torch.ones_like(scores, dtype=torch.bool)
+    for _ in range(min(k_top, scores.shape[-1])):
+        logp = torch.log_softmax(masked.masked_fill(~avail, -1e9), dim=-1)
+        loss = loss - (target * avail * logp).sum(-1)
+        # remove the truly-best remaining candidate and repeat
+        nxt = (ade_k + (~avail) * 1e9).argmin(dim=-1)
+        avail = avail.clone()
+        avail.scatter_(1, nxt.unsqueeze(1), False)
+    return loss
+
+
+def soft_pick_loss(err_score, ade_k, tau=1.0):
+    """Expected REGRET of a soft top-1 pick, in pixels.
+
+        p_k  = softmax(-z_k / tau),  z = err_score standardised within the agent
+        loss = sum_k p_k * ade_k  -  min_k ade_k
+
+    This is the metric the report reads (top-1 ADE), made differentiable. It is
+    added because the two existing top-heavy terms optimise proxies of it and
+    the proxies disagree with it in exactly the cases that matter:
+
+      - Spearman rewards getting rank 17-vs-18 right as much as rank 1-vs-2;
+        top-1 selection does not care about the former at all.
+      - Plackett-Luce's soft target softmax(-ade/tau) is what a good ranker
+        should OUTPUT, but the loss is a cross-entropy on it: two candidates
+        at 12.0 and 12.1 px are almost interchangeable to the metric yet the
+        target still asks for a definite preference, and a candidate at 60 px
+        and one at 40 px are penalised the same way once both have target ~0.
+        Regret weights each candidate by its actual cost in pixels.
+
+    Standardising err_score before the softmax matters. Without it the network
+    can lower the loss by simply scaling its outputs up until p is one-hot,
+    which kills the gradient to every other candidate and makes tau meaningless.
+    With it, tau is in units of "this agent's own score spread": tau=2 is a
+    very soft pick that lets the whole list learn; tau=0.3 is close to the hard
+    argmin used at inference. HDGT_model anneals from the first to the second
+    over the run.
+
+    Subtracting min ade_k does not change the gradient (it is constant in the
+    network's parameters) but makes the value read as pixels of regret, so it
+    is directly comparable with the top1_ade - min_ade gap in the report.
+    """
+    z = (err_score - err_score.mean(-1, keepdim=True)) / \
+        err_score.std(-1, keepdim=True).clamp_min(1e-6)
+    p = F.softmax(-z / tau, dim=-1)
+    return (p * ade_k).sum(-1) - ade_k.min(-1).values          # (N,)
+
+
+def rank_loss(err_score, log_ade, ade_k, types, lam_sp=0.3, lam_pick=1.0,
+              lam_top=0.0, lam_reg=0.2, reg=0.1, tau=5.0, tau_pick=1.0,
+              k_top=3, pick_scale=10.0):
+    """Full objective, aggregated per type then across types.
+
+    Term weights (defaults changed with the soft-pick loss):
+      lam_pick  soft-pick regret (pixels / pick_scale). The primary term now:
+                it IS the reported metric, softened.
+      lam_sp    Spearman, kept at a small weight. It gives every candidate a
+                gradient even when the soft pick has become nearly hard, and
+                keeps the full ordering meaningful, which the bridge plan's
+                per-candidate confidence needs and top-1 regret does not.
+      lam_top   Plackett-Luce, off by default. It targets the same thing as
+                the regret term through a less faithful proxy; left available
+                for ablation.
+      lam_reg   auxiliary log-ADE regression, unchanged.
+
+    pick_scale converts the regret from pixels (typically 3-30) to O(1) so the
+    weights above mean what they say relative to the Spearman term in [-1, 1].
+
+    Type-level aggregation is not cosmetic: pedestrians outnumber bikers by an
+    order of magnitude, so a plain mean over the batch tunes the ranker to
+    pedestrians alone and the biker rows never move.
+    """
+    per_agent = (lam_sp * spearman_loss(err_score, ade_k, reg)
+                 + lam_pick * soft_pick_loss(err_score, ade_k, tau_pick) / pick_scale
+                 + lam_reg * F.smooth_l1_loss(
+                     log_ade, torch.log(ade_k + 1e-3), reduction="none").mean(-1))
+    if lam_top > 0:
+        per_agent = per_agent + lam_top * topk_listwise_loss(err_score, ade_k, k_top, tau)
+    # sqrt(n) weighting across the types present, not a flat mean over them.
+    #
+    # A flat mean is what the REPORT does, and that is right for reporting. As a
+    # training objective it is not: expected counts in a batch of 256, from the
+    # real train split, are ~189 pedestrians, 40 bikers, 23 cars and one or two
+    # each of bus, cart and skater. Weighting the six equally sends about half
+    # the gradient to the ~2% of agents that are bus/cart/skater, and lets a
+    # single skater count for as much as 189 pedestrians. Those three types are
+    # too rare in SDD to estimate anything reliably from.
+    #
+    # sqrt(n) sits between that and plain agent-averaging (which would hand
+    # pedestrians ~74% and bikers 15%): roughly 47/22/17% for pedestrian, biker
+    # and car with ~14% shared by the rare three. Rare types still move the
+    # ranker; one sample no longer swings a step.
+    ts = types.unique()
+    terms = torch.stack([per_agent[types == t].mean() for t in ts])
+    w = torch.stack([(types == t).sum() for t in ts]).to(terms.dtype).sqrt()
+    return (terms * w).sum() / w.sum()
 
 
 class AdaLayerNorm(nn.Module):
@@ -1117,6 +1517,8 @@ class TransformerDiffusionDecoder(nn.Module):
             nn.Linear(self.hidden_dim // 2, self.hidden_dim),
         )
         
+        # how many trailing DDIM steps the settling diagnostic records
+        self.N_SETTLE = 5
         self.pos_embed = nn.Parameter(torch.randn(1, self.pred_len, self.hidden_dim) * 0.02)
         self.time_embed = TimestepEmbedder(self.hidden_dim)
         self.agent_type_embed = AgentTypeEmbedder(6, self.hidden_dim)
@@ -1271,8 +1673,16 @@ class TransformerDiffusionDecoder(nn.Module):
         return predicted_noise, noise, goal_penalty, map_penalty
 
     @torch.no_grad()
-    def ddim_sample(self, agent_features, agent_ids, agent_types, goal_pos, input_dic, num_samples=None, ddim_steps=20):
-        """Fast DDIM sampling with noise prediction and goal conditioning."""
+    def ddim_sample(self, agent_features, agent_ids, agent_types, goal_pos, input_dic,
+                    num_samples=None, ddim_steps=20, collect_settle=False):
+        """Fast DDIM sampling with noise prediction and goal conditioning.
+
+        collect_settle: stash how far each chain still moves over the last few
+        sampling steps into self.last_settle, (batch, K, N_SETTLE). A chain that
+        is still moving when sampling ends never converged, which is a free
+        stand-in for the sample-quality signal a variance head would give.
+        Slot order, detached, and off by default so normal inference is unchanged.
+        """
         if num_samples is None:
             num_samples = self.num_samples
 
@@ -1300,7 +1710,11 @@ class TransformerDiffusionDecoder(nn.Module):
 
         x = torch.randn((batch_size * num_samples, self.pred_len, 2), device=device)
 
+        settle_steps = []
+        first_settle_i = len(timesteps) - self.N_SETTLE
+
         for i, t_idx in enumerate(timesteps):
+            x_prev = x if (collect_settle and i >= first_settle_i) else None
             t = torch.full((batch_size * num_samples,), t_idx, device=device, dtype=torch.long)
 
             # Model predicts noise (epsilon)
@@ -1326,6 +1740,19 @@ class TransformerDiffusionDecoder(nn.Module):
                 x = torch.sqrt(alpha_t_prev) * x_0_pred + torch.sqrt(1 - alpha_t_prev) * predicted_noise
             else:
                 x = x_0_pred
+
+            if x_prev is not None:
+                # mean over time of the per-step L2 move, one scalar per chain
+                settle_steps.append((x - x_prev).norm(dim=-1).mean(dim=-1))
+
+        if collect_settle:
+            if settle_steps:
+                s = torch.stack(settle_steps, dim=-1)
+            else:                      # ddim_steps smaller than N_SETTLE
+                s = torch.zeros((batch_size * num_samples, 0), device=device)
+            if s.shape[-1] < self.N_SETTLE:   # left-pad so the shape is fixed
+                s = F.pad(s, (self.N_SETTLE - s.shape[-1], 0))
+            self.last_settle = s.reshape(batch_size, num_samples, self.N_SETTLE).detach()
 
         trajectories = x.reshape(batch_size, num_samples, self.pred_len, 2)
         return trajectories
@@ -1527,19 +1954,20 @@ def flag_on(value):
 
 class HDGT_model(nn.Module):
     """
-    HDGT model with diffusion decoder and refiner.
+    HDGT model with diffusion decoder, refiner and ranker.
 
     Architecture:
         1. Encoder: HDGT-style heterogeneous graph network
         2. Diffusion Decoder: Generates diverse K samples (noise prediction)
         3. Refiner: Polishes samples for accuracy (5 iterations)
+        4. Ranker: orders the K refined samples, best first (TrajRankNN)
 
-    Training Losses (3-LOSS):
+    Training Losses:
         1. Diffusion Loss: noise prediction + alpha_t-weighted goal penalty
         2. Multi-Step Refiner Loss: best-of-K distance to GT (no goal penalty)
-        3. Goal Loss: K-head WTA regression (+ confidence cross-entropy without a scorer)
-        4. Scorer Loss: ranks the K refined chains (ModeScorer or TrajScorer), weight
-           --scorer_loss_weight, once the goal curriculum is done
+        3. Goal Loss: K-head WTA regression
+        4. Ranker Loss: orders the K refined chains by their ADE to GT, weight
+           --ranker_loss_weight, once the goal curriculum is done
     """
     def __init__(self, input_dim, args):
         super().__init__()
@@ -1557,23 +1985,11 @@ class HDGT_model(nn.Module):
 
         self.use_refiner = getattr(args, 'use_refiner', True)
 
-        # The scorer ranks the K refined chains, so it needs them: it is only
-        # available with the refiner on (that branch generates candidates during
-        # training). --scorer_type picks ModeScorer or TrajScorer. With
-        # --use_scorer False the model is just goal-aware, as in
-        # hdgt_goal_WTA_regressor: the goal predictor keeps its confidence head
-        # and the chains stay in the goal heads' order.
-        self.use_scorer = flag_on(getattr(args, 'use_scorer', True)) and self.use_refiner
-        self.scorer_type = getattr(args, 'scorer_type', 'mode')
-        if self.scorer_type not in ('mode', 'traj'):
-            raise ValueError(f"--scorer_type must be 'mode' or 'traj', got {self.scorer_type!r}")
-        scorer_dropout = args.dropout if flag_on(getattr(args, 'scorer_dropout', False)) else 0.0
-        self.scorer_loss_weight = getattr(args, 'scorer_loss_weight', 0.5)
-        self.scorer_err_weight = getattr(args, 'scorer_err_weight', 1.0)    # ModeScorer only
-        # TrajScorer's soft ranking target (see _normalized_dist)
-        self.conf_tau_min = getattr(args, 'conf_tau_min', 0.02)
-        self.conf_sharpen = getattr(args, 'conf_sharpen', 1.0)
-        self.conf_goal_blend = getattr(args, 'conf_goal_blend', 0.5)
+        # The ranker orders the K chains. Its loss starts once the goal
+        # curriculum is done, as hdgt_goal's scorer's did: before that, every
+        # chain is conditioned on a goal blended toward GT, so the order to
+        # learn is not the one inference produces.
+        self.ranker_loss_weight = getattr(args, 'ranker_loss_weight', 0.5)
 
         # Map penalties, each optional and off by default: the map reaches the
         # model through the graph only (HDGT_encoder). Switched on, each point of
@@ -1600,36 +2016,83 @@ class HDGT_model(nn.Module):
         self.encoder = HDGT_encoder(input_dim, args)
         self.diffusion_decoder = TransformerDiffusionDecoder(args)
         self.refiner = DiffusionRefiner(args)
-        self.goal_predictor = GoalPredictorMTP(
-            args.hidden_dim, num_modes=self.num_samples,
-            with_conf_head=not self.use_scorer,
-        )
-        self.mode_scorer = (
-            ModeScorer(args.hidden_dim, self.pred_len, dropout=scorer_dropout)
-            if self.use_scorer and self.scorer_type == 'mode' else None
-        )
-        self.traj_scorer = (
-            TrajScorer(args.hidden_dim, self.pred_len, dropout=scorer_dropout)
-            if self.use_scorer and self.scorer_type == 'traj' else None
+        self.goal_predictor = GoalPredictorMTP(args.hidden_dim, num_modes=self.num_samples)
+        # Every ranker input is detached, so its loss cannot reward the generator
+        # for chains that are easy to order (the cheapest way to get those is
+        # fewer distinct modes, which minADE would pay for), and train.py gives
+        # it its own parameter group and gradient clip.
+        self.ranker = TrajRankNN(
+            args.hidden_dim, self.pred_len, self.num_samples,
+            n_geom=19 + self.diffusion_decoder.N_SETTLE + 4,   # see build_rank_features
         )
 
         # Controlled by training loop each epoch (start at 0 → ramp up)
         self.goal_curriculum_alpha = 0.0  # 0 = full oracle, 1 = full predicted goal
+        # Ranker soft-pick temperature, annealed across the run (progress 0 -> 1,
+        # set by train.py): soft at first, so every chain gets gradient and the
+        # whole order is learnt, close to the hard argmin used at inference by
+        # the end. In units of each agent's own score spread.
+        self.ranker_progress = 0.0
+        self.ranker_tau_pick_start = 2.0
+        self.ranker_tau_pick_end = 0.3
+        # The ranker's target, per-chain ADE, is in PIXELS, the unit rank_loss's
+        # temperatures are written in. train.py passes the dataset's scale.
+        self.ranker_pixel_scale = float(getattr(args, 'scale_factor', 50.0))
 
-    def _normalized_dist(self, d):
-        """Per-agent distances (N, K) -> 0 for the best chain, 1 at the median one: the
-        scale of TrajScorer's soft target no longer depends on how far off the agent is"""
-        d_min = d.min(dim=1, keepdim=True).values
-        d_med = d.median(dim=1, keepdim=True).values
-        tau = (d_med - d_min).clamp_min(self.conf_tau_min)
-        return (d - d_min) / tau
+    def _rank_chains(self, diffusion_samples, all_refined_steps, goals, obs_trajectories,
+                     target_agent_ids, target_agent_types, input_dic):
+        """Score the K chains with the ranker. Returns (positions, err_score, log_ade):
+
+            positions  (N, K, T, 2)  the chains it scored, as POSITIONS relative
+                                     to the last observation: the refined ones,
+                                     or the decoder's velocities summed when the
+                                     refiner is off
+            err_score  (N, K)        LOW is good, so sort ascending
+            log_ade    (N, K)        predicted log ADE of each chain, in pixels
+
+        All in slot order. The one way into the ranker, for training and
+        inference alike, so it is fit on exactly the features it ranks with.
+        Its inputs are built under no_grad: the ranker learns from the
+        generator's output and sends no gradient back into it. The DDIM
+        settling diagnostic is read off the decoder, where
+        ddim_sample(collect_settle=True) leaves it.
+        """
+        with torch.no_grad():
+            if all_refined_steps is None:
+                positions = torch.cumsum(diffusion_samples, dim=2)
+                # zero is the honest effort for chains no refiner touched
+                refine_delta = positions.new_zeros(
+                    positions.shape[0], positions.shape[1], self.refiner.refine_num)
+            else:
+                # all_refined_steps is (N, refine_num+1, K, T, 2)
+                positions = all_refined_steps[:, -1]
+                # How far the refiner had to drag each chain at each step. A
+                # chain needing heavy correction started out bad. (N, K, 5),
+                # same axis order as last_settle so the two cannot be mixed up.
+                refine_delta = (
+                    (all_refined_steps[:, 1:] - all_refined_steps[:, :-1])
+                    .norm(dim=-1).mean(dim=-1)      # (N, 5, K)
+                    .transpose(1, 2).contiguous()   # (N, K, 5)
+                )
+            state, geom = build_rank_features(
+                positions.float(), goals.float(), obs_trajectories.float(),
+                refine_delta.float(), self.diffusion_decoder.last_settle.float(),
+            )
+            # Neighbour context tokens, for judging social conflict.
+            # Slot-independent: one set per agent, shared by its K.
+            ctx, ctx_mask = self.diffusion_decoder.get_context_features(
+                target_agent_ids, input_dic)
+
+        err_score, log_ade = self.ranker(state, geom, target_agent_types, ctx, ctx_mask)
+        return positions, err_score, log_ade
 
     def forward(self, input_dic):
         """
         Forward pass for training and inference.
         
         Training returns: (total_loss, diffusion_loss, refiner_loss, type_masks, types)
-        Inference returns: (trajectories, type_masks, types)
+        Inference returns: (trajectories, type_masks, types), the K trajectories
+                           of each agent in the ranker's order, best first
         """
         # Encode scene
         output_het_graph = self.encoder(input_dic)
@@ -1696,8 +2159,8 @@ class HDGT_model(nn.Module):
             # Detach encoder features so goal gradients don't flow into the
             # encoder. The goal predictor is a projection head that reads
             # encoder outputs — the encoder is trained by diffusion + refiner.
-            predicted_goals, goal_logits = self.goal_predictor(target_agent_features.detach())
-            # predicted_goals: (N, K, 2), goal_logits: (N, K)
+            predicted_goals = self.goal_predictor(target_agent_features.detach())
+            # predicted_goals: (N, K, 2)
 
             # Per-head squared distance to the GT endpoint
             goal_dists = ((predicted_goals - gt_goal.unsqueeze(1)) ** 2).mean(dim=-1)  # (N, K)
@@ -1712,14 +2175,9 @@ class HDGT_model(nn.Module):
             else:
                 goal_wta_loss = goal_dists.gather(1, winner_idx.unsqueeze(1)).mean()
 
-            # Confidence head: learn which GOAL is closest to the GT goal. Only
-            # there without a scorer (as in hdgt_goal_WTA_regressor) — see
-            # ModeScorer for why this target is the wrong one for ranking.
-            if goal_logits is not None:
-                goal_cls_loss = F.cross_entropy(goal_logits, winner_idx)
-                goal_loss = goal_wta_loss + 0.5 * goal_cls_loss
-            else:
-                goal_loss = goal_wta_loss
+            # No confidence-head term: the ranker orders the chains, as in
+            # hdgt_goal whenever a scorer does.
+            goal_loss = goal_wta_loss
             # Logged separately: best-head MSE — the interpretable goal quality
             # (pixel RMSE = sqrt(value) * 50). Occupies the old goal_recon slot.
             goal_recon_loss = goal_dists.gather(1, winner_idx.unsqueeze(1)).mean().detach()
@@ -1766,22 +2224,27 @@ class HDGT_model(nn.Module):
             # LOSS 2: Multi-Step Refiner
             # ─────────────────────────────────────────────────────────────
             refiner_loss = torch.tensor(0.0, device=predicted_noise.device)
-            scorer_term = torch.tensor(0.0, device=predicted_noise.device)
+
+            # The K chains are sampled whatever the refiner setting, because the
+            # ranker learns to order them. With the refiner on this is exactly
+            # the call hdgt_goal makes; recording the settling diagnostic (a
+            # ranker input) changes no chain.
+            with torch.no_grad():
+                diffusion_samples = self.diffusion_decoder.ddim_sample(
+                    target_agent_features,
+                    target_agent_ids,
+                    target_agent_types,
+                    effective_goals_k,   # (N, K, 2): chain k conditioned on head k
+                    input_dic,
+                    num_samples=self.num_samples,
+                    ddim_steps=20,
+                    collect_settle=True,
+                )
+
+            obs_trajectories = all_agent_raw_traj[target_agent_ids]
+            all_refined_steps = None
 
             if self.use_refiner:
-                with torch.no_grad():
-                    diffusion_samples = self.diffusion_decoder.ddim_sample(
-                        target_agent_features,
-                        target_agent_ids,
-                        target_agent_types,
-                        effective_goals_k,   # (N, K, 2): chain k conditioned on head k
-                        input_dic,
-                        num_samples=self.num_samples,
-                        ddim_steps=20
-                    )
-
-                obs_trajectories = all_agent_raw_traj[target_agent_ids]
-
                 all_refined_steps, _ = self.refiner(
                     diffusion_samples,
                     obs_trajectories,
@@ -1815,66 +2278,42 @@ class HDGT_model(nn.Module):
                     refiner_map_loss = map_depth(
                         densify_path(all_refined_steps[:, -1]), map_geom, map_mask).mean()
 
-                # ─────────────────────────────────────────────────────────
-                # LOSS 4: scorer — rank the chains we actually select from
-                # ─────────────────────────────────────────────────────────
-                if self.use_scorer:
-                    final_traj = all_refined_steps[:, -1].detach()   # (N, K, T, 2)
+            # ─────────────────────────────────────────────────────────────
+            # LOSS 4: ranker — rank the chains we actually select from
+            # ─────────────────────────────────────────────────────────────
+            # It scores the very chains the refiner loss was just computed on,
+            # each beside the goal it was conditioned on (at curriculum alpha=1,
+            # exactly the inference conditioning), and learns to order them by
+            # per-chain ADE, the SAME definition the report ranks on. These
+            # chains were sampled with the denoiser's dropout live, the one
+            # difference from inference that training online leaves.
+            positions, err_score, log_ade = self._rank_chains(
+                diffusion_samples, all_refined_steps, effective_goals_k,
+                obs_trajectories, target_agent_ids, target_agent_types, input_dic)
+            with torch.no_grad():
+                ade_k = ((positions - labels_pos.unsqueeze(1)).norm(dim=-1).mean(dim=-1)
+                         * self.ranker_pixel_scale)                    # (N, K), pixels
+            tau_pick = self.ranker_tau_pick_start + (
+                self.ranker_tau_pick_end - self.ranker_tau_pick_start) * self.ranker_progress
+            ranker_loss = rank_loss(err_score.float(), log_ade.float(), ade_k.float(),
+                                    target_agent_types, tau_pick=tau_pick)
 
-                    if self.scorer_type == 'mode':
-                        # Per-chain ADE, the SAME definition the report ranks on.
-                        # (refiner_loss above uses RMSE-over-time; its argmin is a
-                        # slightly different chain, so do not reuse best_mode_idx.)
-                        ade_k = (final_traj - labels_pos.unsqueeze(1)).norm(dim=-1).mean(dim=-1)
-                        ade_winner = ade_k.argmin(dim=1)                 # (N,)
-
-                        scorer_logits, scorer_log_err = self.mode_scorer(
-                            target_agent_features, effective_goals_k,
-                            final_traj, obs_trajectories,
-                        )
-                        scorer_cls_loss = F.cross_entropy(scorer_logits, ade_winner)
-                        scorer_err_loss = F.smooth_l1_loss(
-                            scorer_log_err, torch.log(ade_k + 1e-3)
-                        )
-                        scorer_loss = scorer_cls_loss + self.scorer_err_weight * scorer_err_loss
-                        self.last_scorer_err = scorer_err_loss.detach()
-                    else:
-                        # TrajScorer: soft target softmax(-z), z = each chain's path
-                        # error plus conf_goal_blend x its goal error, both scaled
-                        # per agent (see _normalized_dist)
-                        v0 = (obs_trajectories[:, -1] - obs_trajectories[:, -2]).detach()
-                        with torch.no_grad():
-                            ctx, ctx_mask = self.diffusion_decoder.get_context_features(
-                                target_agent_ids, input_dic)
-                        scorer_logits = self.traj_scorer(
-                            final_traj, v0, target_agent_features.detach(), ctx, ctx_mask)
-                        goal_eucl = (predicted_goals.detach() - gt_goal.unsqueeze(1)).norm(dim=-1)
-                        d_traj = distances[:, -1, :].detach()
-                        z = self.conf_sharpen * (self._normalized_dist(d_traj)
-                                                 + self.conf_goal_blend * self._normalized_dist(goal_eucl))
-                        soft_target = F.softmax(-z, dim=1)
-                        scorer_cls_loss = F.kl_div(F.log_softmax(scorer_logits, dim=1), soft_target,
-                                                   reduction='batchmean')
-                        scorer_loss = scorer_cls_loss
-                        self.last_scorer_err = None
-
-                    # Before the curriculum completes, every chain is conditioned
-                    # on a goal blended toward GT, so the ranking target is noise.
-                    # Gate with a float rather than skipping the term, so the
-                    # scorer's parameters still receive (zero) gradient and DDP
-                    # does not need find_unused_parameters.
-                    gate = 1.0 if self.goal_curriculum_alpha >= 1.0 else 0.0
-                    scorer_term = gate * self.scorer_loss_weight * scorer_loss
-                    # Stashed UNGATED so the log shows the scorer's true state
-                    # even while it is still gated off.
-                    self.last_scorer_loss = scorer_loss.detach()
-                    self.last_scorer_cls = scorer_cls_loss.detach()
+            # Before the curriculum completes, every chain is conditioned on a
+            # goal blended toward GT, so the ranking target is not the one
+            # inference poses. Gate with a float rather than skipping the term,
+            # so the ranker's parameters still receive (zero) gradient and DDP
+            # does not need find_unused_parameters.
+            gate = 1.0 if self.goal_curriculum_alpha >= 1.0 else 0.0
+            ranker_term = gate * self.ranker_loss_weight * ranker_loss
+            # Stashed UNGATED so the log shows the ranker's true state even
+            # while it is still gated off.
+            self.last_ranker_loss = ranker_loss.detach()
 
             # ─────────────────────────────────────────────────────────────
             # TOTAL LOSS
             # ─────────────────────────────────────────────────────────────
-            # scorer_term is kept out of goal_loss on purpose: every scorer
-            # input is detached, so this term can only move the scorer's weights.
+            # ranker_term is kept out of goal_loss on purpose: every ranker
+            # input is detached, so this term can only move the ranker's weights.
             # Nothing it does can degrade the goal predictor or the generator.
             # Switched-off map penalties are 0 here, so they add nothing
             map_term = (self.goal_map_penalty_weight * goal_map_loss +
@@ -1888,7 +2327,7 @@ class HDGT_model(nn.Module):
                 self.diffusion_loss_weight * diffusion_loss +
                 self.refiner_loss_weight * refiner_loss +
                 self.goal_loss_weight * goal_loss +
-                scorer_term +
+                ranker_term +
                 map_term
             )
 
@@ -1901,71 +2340,60 @@ class HDGT_model(nn.Module):
             # Each of the K chains is conditioned on its own goal mode, matching
             # the per-chain training conditioning at curriculum alpha=1.
             # Diversity comes from K distinct goals AND K DDIM noise seeds.
-            predicted_goals, goal_logits = self.goal_predictor(
+            predicted_goals = self.goal_predictor(
                 target_agent_features.detach()
-            )  # (batch, K, 2), (batch, K)
+            )  # (batch, K, 2)
 
-            trajectories = self.diffusion_decoder.ddim_sample(
+            diffusion_samples = self.diffusion_decoder.ddim_sample(
                 target_agent_features,
                 target_agent_ids,
                 target_agent_types,
                 predicted_goals,
                 input_dic,
                 num_samples=self.num_samples,
-                ddim_steps=20
+                ddim_steps=20,
+                collect_settle=True,   # a ranker input
             )
 
             obs_trajectories = all_agent_raw_traj[target_agent_ids]
 
+            trajectories = diffusion_samples
+            all_refined_steps = None
             if self.use_refiner:
-                trajectories, _ = self.refiner(
-                    trajectories,
+                # return_all_steps hands the ranker the refiner's per-step
+                # effort; the final chains are the same either way
+                all_refined_steps, _ = self.refiner(
+                    diffusion_samples,
                     obs_trajectories,
                     target_agent_features,
                     predicted_goals,
-                    return_all_steps=False
+                    return_all_steps=True
                 )
+                trajectories = all_refined_steps[:, -1]
 
             # Rank the K chains so index 0 is the one we predict is best. This
             # is a pure output permutation AFTER generation (the head-k <->
             # modal-emb-k pairing seen during training is untouched):
             # minADE/minFDE are unaffected, while single-mode ADE/FDE
-            # (preds[:, 0]) come from the ranking. Without a scorer the chains
-            # keep the goal heads' order, as in hdgt_goal_WTA_regressor.
-            self.last_pred_error = None
-            self.last_mode_probs = None
-            if self.use_scorer:
-                if self.scorer_type == 'mode':
-                    # Scored from the realised chains — same inputs as at training.
-                    scorer_logits, scorer_log_err = self.mode_scorer(
-                        target_agent_features, predicted_goals,
-                        trajectories, obs_trajectories,
-                    )
-                    conf_order = torch.argsort(scorer_logits, dim=1, descending=True)
-                    # Calibrated absolute error estimate, in scaled units, in the
-                    # same order as the returned chains (BRIDGE Stage D needs this;
-                    # a within-agent softmax cannot provide it).
-                    self.last_pred_error = torch.exp(
-                        scorer_log_err.gather(1, conf_order)
-                    ).detach()
-                else:
-                    v0 = obs_trajectories[:, -1] - obs_trajectories[:, -2]
-                    ctx, ctx_mask = self.diffusion_decoder.get_context_features(
-                        target_agent_ids, input_dic)
-                    scorer_logits = self.traj_scorer(
-                        trajectories, v0, target_agent_features.detach(), ctx, ctx_mask)
-                    conf_order = torch.argsort(scorer_logits, dim=1, descending=True)
-                # The scorer's probability for each chain, in the returned order
-                self.last_mode_probs = torch.softmax(scorer_logits, dim=1).gather(
-                    1, conf_order).detach()
-                trajectories = trajectories.gather(
-                    1,
-                    conf_order[:, :, None, None].expand(
-                        -1, -1, trajectories.shape[2], trajectories.shape[3]
-                    )
+            # (preds[:, 0]) come from the ranking.
+            _, err_score, log_ade = self._rank_chains(
+                diffusion_samples, all_refined_steps, predicted_goals,
+                obs_trajectories, target_agent_ids, target_agent_types, input_dic)
+            # err_score is LOW-is-good, so ascending: descending would invert
+            # the ranker completely and look exactly like a failed training run
+            conf_order = torch.argsort(err_score, dim=1, descending=False)
+            # The ranker's absolute error estimate for each chain, in the
+            # returned order. PIXELS, not scaled units: log_ade is fit against
+            # ADE in pixels, so consumers must not multiply by SCALE_FACTOR.
+            self.last_pred_error = torch.exp(log_ade.gather(1, conf_order)).detach()
+            trajectories = trajectories.gather(
+                1,
+                conf_order[:, :, None, None].expand(
+                    -1, -1, trajectories.shape[2], trajectories.shape[3]
                 )
-                predicted_goals = predicted_goals.gather(
-                    1, conf_order[:, :, None].expand(-1, -1, 2))
+            )
+            predicted_goals = predicted_goals.gather(
+                1, conf_order[:, :, None].expand(-1, -1, 2))
 
             # The goals in the same order as the returned chains (goal k belongs
             # to chain k) for downstream consumers (visualization); attribute

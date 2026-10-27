@@ -8,6 +8,9 @@ metrics report as <checkpoint>_<split>_report.txt next to the checkpoint.
 Defaults to the VAL split (the 8 VAL_VIDEOS held out of the train folder).
 The test folder is the final holdout: run it once, at the end, with --split test.
 
+The ranker is part of the model and trained with it, so it comes with the
+checkpoint: ADE/FDE are its first chain, minADE/minFDE the best of the K.
+
 Usage:
     python test_sdd.py --checkpoint logs/Hdgt_goal_DATE/snapshot/best_min_fde.pt
     python test_sdd.py --checkpoint logs/Hdgt_goal_DATE/snapshot/best_min_fde.pt --split test
@@ -95,25 +98,25 @@ class AverageMeter:
         self.avg = self.sum / self.count if self.count > 0 else 0
 
 
-def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_desc):
-    """The SCORER RESULTS block of the report: how well the scorer orders the K chains"""
+def ranker_block(ranker_rows, agent_type_lis, num_prediction, pred_len, ranker_desc):
+    """The RANKER RESULTS block of the report: how well the ranker orders the K chains"""
     K = num_prediction
-    rows = {at: scorer_rows[at] for at in agent_type_lis if scorer_rows[at]}
+    rows = {at: ranker_rows[at] for at in agent_type_lis if ranker_rows[at]}
     rows = {"ALL": [r for at in rows for r in rows[at]], **rows}
 
     def cat(rs, key):
         return np.concatenate([r[key] for r in rs], axis=0)
 
     lines = [
-        f"SCORER RESULTS  ({scorer_desc}, {pred_len} steps = {pred_len * 0.4:.1f}s, pixels)",
+        f"RANKER RESULTS  ({ranker_desc}, {pred_len} steps = {pred_len * 0.4:.1f}s, pixels)",
         "-" * 80,
-        "  The scorer sorts the K chains; its first chain gives ADE and FDE above.",
-        "  hit@n    : % of trajectories whose best chain is among the scorer's first n",
-        "  meanRank : mean position of the best chain in the scorer's order (0 = first)",
-        "  picked   : error of the scorer's first chain      random: mean error over the K chains",
+        "  The ranker sorts the K chains; its first chain gives ADE and FDE above.",
+        "  hit@n    : % of trajectories whose best chain is among the ranker's first n",
+        "  meanRank : mean position of the best chain in the ranker's order (0 = first)",
+        "  picked   : error of the ranker's first chain      random: mean error over the K chains",
         "  goal     : error of the chain whose goal is closest to the true goal",
         "  best     : error of the best chain (minADE / minFDE)",
-        "  closed   : share of the random-to-best gap the scorer closes, (random-picked)/(random-best)",
+        "  closed   : share of the random-to-best gap the ranker closes, (random-picked)/(random-best)",
         f"  chance   : hit@1 {100 / K:.1f}%, hit@3 {min(300 / K, 100):.1f}%, hit@5 {min(500 / K, 100):.1f}%, "
         f"meanRank {(K - 1) / 2:.1f}, closed 0%",
     ]
@@ -127,7 +130,7 @@ def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_d
             if valid.sum() == 0:
                 continue
             err = err[valid]
-            rank = err.argmin(axis=1)            # chains come in the scorer's order
+            rank = err.argmin(axis=1)            # chains come in the ranker's order
             picked, random_, best = err[:, 0].mean(), err.mean(axis=1).mean(), err.min(axis=1).mean()
             has_goal = valid & ~np.isnan(goal_dist).any(axis=1)
             goal_text = "--"
@@ -140,30 +143,18 @@ def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_d
                 f"{(rank < 5).mean() * 100:>7.1f}%{rank.mean():>10.2f}{picked:>9.3f}{random_:>9.3f}"
                 f"{goal_text:>9}{best:>9.3f}{closed:>7.1f}%")
 
-    # Confidence, over every trajectory
-    ade, probs = cat(rows["ALL"], "ade"), cat(rows["ALL"], "probs")
+    # The ranker's absolute error estimate for its picked chain, over every trajectory
+    ade = cat(rows["ALL"], "ade")
     valid = ~np.isnan(ade).any(axis=1)
-    ade, probs = ade[valid], probs[valid]
-    rank = ade.argmin(axis=1)
-    entropy = -(probs * np.log(np.clip(probs, 1e-12, None))).sum(axis=1) / np.log(K)
+    pred_err = cat(rows["ALL"], "pred_err")[valid][:, 0]
+    actual = ade[valid][:, 0]
+    corr = float(np.corrcoef(pred_err, actual)[0, 1]) if len(actual) > 1 else float("nan")
     lines += [
         "",
-        "  Confidence (the scorer's softmax over the K chains, every trajectory):",
-        f"    picked chain : mean probability {probs[:, 0].mean():.3f}; it is the lowest-ADE chain "
-        f"{(rank == 0).mean() * 100:.1f}% of the time",
-        f"    best chain   : mean probability {probs[np.arange(len(rank)), rank].mean():.3f}  "
-        f"(uniform {1 / K:.3f})",
-        f"    spread       : normalised entropy {entropy.mean():.3f}  (1 = uniform over the K, 0 = all on one chain)",
+        "  Ranker error head (its predicted ADE for the picked chain, every trajectory):",
+        f"    predicted {pred_err.mean():.3f} px vs actual {actual.mean():.3f} px  "
+        f"(bias {pred_err.mean() - actual.mean():+.3f} px, correlation {corr:.3f})",
     ]
-    if rows["ALL"][0]["pred_err"] is not None:
-        pred_err = cat(rows["ALL"], "pred_err")[valid][:, 0]
-        actual = ade[:, 0]
-        corr = float(np.corrcoef(pred_err, actual)[0, 1]) if len(actual) > 1 else float("nan")
-        lines += [
-            "  ModeScorer error head (its predicted ADE for the picked chain):",
-            f"    predicted {pred_err.mean():.3f} px vs actual {actual.mean():.3f} px  "
-            f"(bias {pred_err.mean() - actual.mean():+.3f} px, correlation {corr:.3f})",
-        ]
     lines += ["=" * 80]
     return lines
 
@@ -324,9 +315,6 @@ def main():
     # Unused at test time but needed to instantiate the model
     parser.add_argument("--goal_loss_weight", type=float, default=0.5)
     parser.add_argument("--goal_curriculum_epochs", type=int, default=5)
-    # Scorer: read from the checkpoint's weights by default, so the model is rebuilt as trained
-    parser.add_argument("--use_scorer", type=str, default=None)
-    parser.add_argument("--scorer_type", type=str, default=None, choices=["mode", "traj"])
     # Map nodes in the graph: read from the checkpoint by default
     parser.add_argument("--use_map", type=str, default=None)
 
@@ -369,14 +357,12 @@ def main():
               "from it are\n         optimistic. Retrain with --use_val_split True "
               "for a clean final result.")
 
-    # The scorer the checkpoint was trained with, read from its weights (traj_scorer.* =
-    # TrajScorer, mode_scorer.* = ModeScorer, neither = no scorer) unless given on the command line
-    scorer_in_weights = next((kind for kind, prefix in (("traj", "traj_scorer."), ("mode", "mode_scorer."))
-                              if any(k.startswith(prefix) for k in checkpoint["model_state_dict"])), None)
-    if args.use_scorer is None:
-        args.use_scorer = "True" if scorer_in_weights else "False"
-    if args.scorer_type is None:
-        args.scorer_type = scorer_in_weights or "mode"
+    # Without ranker weights, ADE/FDE would be an untrained ranker's pick: refuse such a checkpoint
+    if not any(k.startswith("ranker.") for k in checkpoint["model_state_dict"]):
+        print("ERROR: the checkpoint has no ranker weights, so it was not trained by this "
+              "version's train.py.\n       ADE/FDE would come from an untrained ranker.")
+        sys.exit(1)
+
     # Map nodes in the graph, as trained (the checkpoint's args, else its weights), unless given
     if args.use_map is None:
         saved = checkpoint.get("args", {}).get("use_map")
@@ -390,9 +376,9 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    scorer_desc = ({"mode": "ModeScorer", "traj": "TrajScorer"}.get(getattr(model, "scorer_type", None), "?")
-                   if getattr(model, "use_scorer", False) else "none (chains in goal-head order)")
-    print(f"Model loaded — refiner={'ON' if args.use_refiner else 'OFF'}, scorer={scorer_desc}, K={args.num_prediction}")
+    ranker_desc = "TrajRankNN, trained with the model"
+    print(f"Model loaded — refiner={'ON' if args.use_refiner else 'OFF'}, ranker={ranker_desc}, "
+          f"map={'ON' if args.use_map else 'OFF'}, K={args.num_prediction}")
 
     # ------------------------------------------------------------------
     # Load evaluation dataset (--split: val or test)
@@ -443,12 +429,11 @@ def main():
         for mt in metric_type_lis
     }
 
-    # Scorer results (only with a scorer): every chain's error at the full horizon, in the
-    # scorer's order, with the scorer's outputs for it. Per type, every trajectory counts once.
-    use_scorer = getattr(model, "use_scorer", False)
-    scorer_rows = {at: [] for at in agent_type_lis}
-    # Map compliance (map nodes only): each chain's and the GT's deepest point inside a
-    # forbidden shape, px
+    # Ranker results: every chain's error at the full horizon, in the ranker's order, with the
+    # ranker's outputs for it. Per type, every trajectory counts once.
+    ranker_rows = {at: [] for at in agent_type_lis}
+    # Map compliance: each chain's and the GT's deepest point inside a forbidden shape, px.
+    # With the map off too: the shapes come with every batch, so the two runs compare
     map_rows = {at: [] for at in agent_type_lis}
 
     print(f"\nRunning inference ...")
@@ -477,20 +462,16 @@ def main():
             label_pos  = data["label_pos_lis"]
             label_mask = data["label_mask_lis"]
 
-            if args.use_map:
-                pos_t = trajectories if output_is_positions else torch.cumsum(trajectories, dim=2)
-                geom, forbid = data["map_geom_lis"], data["map_forbid_mask_lis"]
-                depth_k = (model_module.map_depth(model_module.densify_path(pos_t), geom, forbid)
-                           .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()                  # (N, K)
-                depth_gt = (model_module.map_depth(model_module.densify_path(label_pos), geom, forbid)
-                            .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()                 # (N,)
+            # Both come in the same order as the returned chains
+            goals_np = model.last_predicted_goals.cpu().numpy()                      # (N, K, 2)
+            perr_np = model.last_pred_error.cpu().numpy()   # (N, K), already pixels: no SCALE_FACTOR
 
-            if use_scorer:
-                # All three come in the same order as the returned chains
-                goals_np = model.last_predicted_goals.cpu().numpy()                  # (N, K, 2)
-                probs_np = model.last_mode_probs.cpu().numpy()                       # (N, K)
-                perr = getattr(model, "last_pred_error", None)                       # ModeScorer only
-                perr_np = perr.cpu().numpy() * SCALE_FACTOR if perr is not None else None
+            pos_t = trajectories if output_is_positions else torch.cumsum(trajectories, dim=2)
+            geom, forbid = data["map_geom_lis"], data["map_forbid_mask_lis"]
+            depth_k = (model_module.map_depth(model_module.densify_path(pos_t), geom, forbid)
+                       .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()                  # (N, K)
+            depth_gt = (model_module.map_depth(model_module.densify_path(label_pos), geom, forbid)
+                        .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()                 # (N,)
 
             for type_idx, at in enumerate(agent_type_lis):
                 mask = pred_bool_type_lis[type_idx].cpu().numpy()
@@ -501,19 +482,15 @@ def main():
                 labels = label_pos[mask].cpu().numpy()  # (M, pred_len, 2)
                 masks  = label_mask[mask].cpu().numpy() # (M, pred_len)
 
-                # Chain 0: the scorer's pick with a scorer; the goal heads' first chain without one
+                # Chain 0: the ranker's pick
                 best_pred = preds[:, 0, :, :]
 
-                if args.use_map:
-                    map_rows[at].append({"chains": depth_k[mask], "gt": depth_gt[mask]})
-
-                if use_scorer:
-                    ade_k, fde_k = chain_errors(preds, labels, masks, scale_factor=SCALE_FACTOR)
-                    goal_dist = np.linalg.norm(goals_np[mask] - labels[:, -1][:, np.newaxis], axis=-1)
-                    goal_dist[masks[:, -1] == 0] = np.nan    # no true goal without the last step
-                    scorer_rows[at].append({"ade": ade_k, "fde": fde_k, "goal_dist": goal_dist,
-                                            "probs": probs_np[mask],
-                                            "pred_err": perr_np[mask] if perr_np is not None else None})
+                ade_k, fde_k = chain_errors(preds, labels, masks, scale_factor=SCALE_FACTOR)
+                goal_dist = np.linalg.norm(goals_np[mask] - labels[:, -1][:, np.newaxis], axis=-1)
+                goal_dist[masks[:, -1] == 0] = np.nan    # no true goal without the last step
+                ranker_rows[at].append({"ade": ade_k, "fde": fde_k, "goal_dist": goal_dist,
+                                        "pred_err": perr_np[mask]})
+                map_rows[at].append({"chains": depth_k[mask], "gt": depth_gt[mask]})
 
                 for ln in length_lis:
                     res, cnt = cal_ade_fde(
@@ -559,7 +536,7 @@ def main():
         f"Scale factor: {SCALE_FACTOR}  (metrics in original pixel coordinates)",
         f"K samples   : {args.num_prediction}",
         f"Refiner     : {'ON' if args.use_refiner else 'OFF'}",
-        f"Scorer      : {scorer_desc}",
+        f"Ranker      : {ranker_desc}",
         f"Map         : {'ON (shapes in the graph; agents attend to them in every GNN layer)' if args.use_map else 'OFF'}",
         f"Random seed : {args.seed}",
         f"Eval time   : {elapsed_total:.1f}s",
@@ -570,10 +547,8 @@ def main():
                               {"ADE": "ade", "FDE": "fde", "minADE": "min_ade", "minFDE": "min_fde"},
                               args.num_prediction, args.split)
 
-    if use_scorer:
-        lines += scorer_block(scorer_rows, agent_type_lis, args.num_prediction, args.pred_len, scorer_desc)
-    if args.use_map:
-        lines += map_block(map_rows, agent_type_lis)
+    lines += ranker_block(ranker_rows, agent_type_lis, args.num_prediction, args.pred_len, ranker_desc)
+    lines += map_block(map_rows, agent_type_lis)
 
     report = "\n".join(lines)
 

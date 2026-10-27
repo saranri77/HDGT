@@ -138,22 +138,17 @@ parser.add_argument('--port', type=str, default="31243", help='DDP port')
 parser.add_argument('--amp', type=str, default="none", help='mixed precision: none, fp16, bf16')
 
 #### Goal Predictor (multimodal K-head WTA)
-parser.add_argument('--goal_loss_weight', type=float, default=0.5, help='weight on goal loss (WTA + confidence CE)')
+parser.add_argument('--goal_loss_weight', type=float, default=0.5, help='weight on goal loss (WTA)')
 parser.add_argument('--goal_curriculum_epochs', type=int, default=10, help='epochs to ramp oracle→predicted goal')
 
-#### Scorer: ranks the K refined chains (index 0 = the single-trajectory prediction)
-parser.add_argument('--use_scorer', type=str, default="False", help='rank the K chains with a scorer (off by default in this version); False = just goal-aware, as hdgt_goal_WTA_regressor (confidence head trained, chains left in the goal heads\' order)')
-parser.add_argument('--scorer_type', type=str, default="mode", choices=["mode", "traj"], help='mode = ModeScorer (hand-made features of each chain), traj = TrajScorer (raw chains, attention across them and to the neighbours)')
-parser.add_argument('--scorer_loss_weight', type=float, default=0.5, help='weight on the scorer loss, applied once the goal curriculum is done (isolated: cannot affect the generator); 0.5 = hdgt_bridge\'s effective weight')
-parser.add_argument('--scorer_err_weight', type=float, default=1.0, help='ModeScorer only: weight on the per-mode log-ADE regression inside its loss')
-parser.add_argument('--clip_scorer_separately', type=str, default="True", help='clip the scorer\'s gradients on their own, max norm 1.0 (True), or leave them unclipped (False); the rest of the model is always clipped on its own, never in one global clip')
-parser.add_argument('--scorer_dropout', type=str, default="False", help='use --dropout inside the scorer (True) or no dropout in it (False)')
-parser.add_argument('--conf_tau_min', type=float, default=0.02, help='TrajScorer only: floor for the adaptive soft-target temperature, scaled units (0.02 = 1 px)')
-parser.add_argument('--conf_goal_blend', type=float, default=0.5, help='TrajScorer only: weight of goal-space distance in the soft target')
-parser.add_argument('--conf_sharpen', type=float, default=1.0, help='TrajScorer only: sharpness of the soft target')
+#### Ranker: orders the K refined chains (index 0 = the single-trajectory prediction)
+parser.add_argument('--ranker_loss_weight', type=float, default=0.5, help='weight on the ranker loss, applied once the goal curriculum is done (isolated: cannot affect the generator)')
+parser.add_argument('--clip_ranker_separately', type=str, default="True", help='clip the ranker\'s gradients on their own, max norm 1.0 (True), or leave them unclipped (False); the rest of the model is always clipped on its own, never in one global clip')
+parser.add_argument('--ranker_lr', type=float, default=3e-4, help='ranker learning rate, its own parameter group (same warm-up and decay schedule as --lr)')
+parser.add_argument('--ranker_weight_decay', type=float, default=1e-2, help='ranker AdamW weight decay, its own parameter group')
 
-#### Map: through the graph only; every penalty optional and off by default
-parser.add_argument('--use_map', type=str, default="True", help='add the grass/obstacle shapes to the graph as map nodes: agents attend to them in every GNN layer, so the map shapes the agent embedding (True/False)')
+#### Map, as hdgt_map_gnn: through the graph only; every penalty optional and off by default
+parser.add_argument('--use_map', type=str, default="False", help='add the grass/obstacle shapes to the graph as map nodes: agents attend to them in every GNN layer, so the map shapes the agent embedding (True/False)')
 parser.add_argument('--goal_map_penalty', type=str, default="False", help='penalise predicted goals inside a shape their agent may not enter (obstacles for everyone, grass for all but pedestrians): cost = weight x depth inside, linear, 0 outside (True/False)')
 parser.add_argument('--goal_map_penalty_weight', type=float, default=0.1, help='weight of --goal_map_penalty, in [0, 1]')
 parser.add_argument('--diffusion_map_penalty', type=str, default="False", help="penalise the denoiser's recovered paths inside such shapes, the same way (True/False)")
@@ -215,28 +210,33 @@ def flag_on(value):
     return value in (True, 'True', 'true', '1')
 
 
-def clip_grads(model, max_norm=1.0, clip_scorer=True):
-    """Clip the rest of the model, and the scorer on its own (--clip_scorer_separately).
+def ranker_and_rest(model):
+    """(ranker parameters, every other parameter): optimised and clipped apart"""
+    m = model.module if hasattr(model, "module") else model
+    ranker, rest = [], []
+    for name, p in m.named_parameters():
+        (ranker if name.startswith("ranker.") else rest).append(p)
+    return ranker, rest
+
+
+def clip_grads(model, max_norm=1.0, clip_ranker=True):
+    """Clip the rest of the model, and the ranker on its own (--clip_ranker_separately).
 
     A single clip_grad_norm_ over all parameters couples modules that share
-    nothing: the scorer's gradient enters the GLOBAL norm, so a large scorer
-    gradient scales DOWN the encoder / decoder / refiner updates. Measured at
-    3.5% shrinkage on an untrained model, and the scorer's gradient is largest
-    exactly when it starts training (curriculum alpha reaches 1) — mid-run for
-    the generator. Clipping the two groups separately restores the isolation
-    that detaching the scorer's inputs was meant to provide.
+    nothing: the ranker's gradient enters the GLOBAL norm, so a large ranker
+    gradient scales DOWN the encoder / decoder / refiner / goal-predictor
+    updates. On an untrained model the ranker's gradient norm is about the
+    generator's, which would shrink every generator update by ~27%. Clipping
+    the two groups separately restores the isolation that detaching the
+    ranker's inputs was meant to provide.
 
-    There is never one global clip. clip_scorer=False leaves the scorer's
+    There is never one global clip. clip_ranker=False leaves the ranker's
     gradients unclipped; the rest of the model is always clipped on its own.
-    Without a scorer, the rest is the whole model.
     """
-    m = model.module if hasattr(model, "module") else model
-    scorer, rest = [], []
-    for name, p in m.named_parameters():
-        (scorer if name.startswith(("mode_scorer", "traj_scorer")) else rest).append(p)
+    ranker, rest = ranker_and_rest(model)
     torch.nn.utils.clip_grad_norm_(rest, max_norm)
-    if clip_scorer and scorer:
-        torch.nn.utils.clip_grad_norm_(scorer, max_norm)
+    if clip_ranker and ranker:
+        torch.nn.utils.clip_grad_norm_(ranker, max_norm)
 
 
 def cal_min_ade_fde(preds, labels, masks, scale_factor=1.0):
@@ -293,10 +293,12 @@ def main():
     print(" Decoder: Diffusion model (generates K diverse samples)")
     print(" Refiner: 5-step CNN refinement (like original HDGT)")
     print("-" * 80)
-    print("TRAINING LOSSES (3 LOSSES):")
+    print("TRAINING LOSSES (3 LOSSES + RANKER):")
     print("  1. Diffusion Loss (weight=1.0): noise prediction + alpha_t-weighted goal penalty")
     print("  2. Refiner Loss (weight=1.0): best-of-K distance to GT over 6 steps")
-    print("  3. Goal Loss (weight=0.5): K-head WTA regression + confidence CE")
+    print("  3. Goal Loss (weight=0.5): K-head WTA regression")
+    print(f"  4. Ranker Loss (weight={args.ranker_loss_weight}, once the goal curriculum is done): orders the K")
+    print("     chains by ADE to GT; inputs detached, so it can only move the ranker")
     print("-" * 80)
     print("KEY FEATURES:")
     print(" Multi-step refiner loss (equal gradient to all layers)")
@@ -372,6 +374,7 @@ def main_worker(gpu, gpu_count, global_seed, args):
           + (", ".join(f"{part} (weight {getattr(args, part + '_map_penalty_weight')})" for part in map_penalties)
              or "none")
           + (f"; shapes the agent's own GT path enters exempt: {args.map_penalty_gt_exempt}" if map_penalties else ""))
+    args.scale_factor = SCALE_FACTOR    # the ranker's target is in pixels
 
     model = model_module.HDGT_model(input_dim=8, args=args)
     model.apply(model_module.weights_init)
@@ -394,7 +397,13 @@ def main_worker(gpu, gpu_count, global_seed, args):
         model.load_state_dict(checkpoint["model_state_dict"])
 
     model = model.to(device, non_blocking=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    # The ranker is its own parameter group: its learning rate and weight decay never reach the
+    # rest of the model, which trains exactly as with one group
+    ranker_params, rest_params = ranker_and_rest(model)
+    optimizer = torch.optim.AdamW(
+        [{"params": rest_params, "name": "rest"},
+         {"params": ranker_params, "name": "ranker", "lr": args.ranker_lr, "weight_decay": args.ranker_weight_decay}],
+        lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     
     step_per_epoch = train_sample_num // args.batch_size // max(gpu_count, 1) + 1
     total_steps = step_per_epoch * args.n_epoch
@@ -468,15 +477,20 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
     recorder["refiner_loss"] = AverageMeter()
     recorder["goal_loss"] = AverageMeter()
     recorder["goal_recon_loss"] = AverageMeter()
-    recorder["scorer_cls"] = AverageMeter()
-    recorder["scorer_err"] = AverageMeter()
+    recorder["ranker_loss"] = AverageMeter()
     recorder["hit1"] = AverageMeter()
     recorder["meanrank"] = AverageMeter()
+    recorder["rank_top1_ade"] = AverageMeter()
+    recorder["rank_rand_ade"] = AverageMeter()
+    recorder["rank_orac_ade"] = AverageMeter()
 
     # Goal curriculum (only meaningful during training)
     if is_train:
         model_ref = model.module if hasattr(model, 'module') else model
         model_ref.goal_curriculum_alpha = min(1.0, (epoch - 1) / max(1, args.goal_curriculum_epochs))
+        # The ranker's soft-pick temperature anneals over the whole run: 0 on the first epoch,
+        # 1 on the last
+        model_ref.ranker_progress = min(1.0, (epoch - 1) / max(1, args.n_epoch - 1))
 
     start_time = time.time()
     if is_train:
@@ -506,9 +520,12 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
             decay_coefficient *= 0.5
 
     if is_train and scheduler is not None and optimizer is not None:
-        scheduler.base_lrs = [args.lr * decay_coefficient]
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = args.lr * decay_coefficient
+        # Each parameter group decays from its own base rate: --lr, or --ranker_lr for the ranker
+        group_lrs = [(args.ranker_lr if param_group.get("name") == "ranker" else args.lr) * decay_coefficient
+                     for param_group in optimizer.param_groups]
+        scheduler.base_lrs = group_lrs
+        for param_group, group_lr in zip(optimizer.param_groups, group_lrs):
+            param_group["lr"] = group_lr
 
     use_amp = (scaler is not None)
     global_step = (epoch - 1) * (num_sample // batch_size // max(gpu_count, 1))
@@ -558,20 +575,22 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                     if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                        clip_grads(model, 1.0, flag_on(args.clip_scorer_separately))
+                        clip_grads(model, 1.0, flag_on(args.clip_ranker_separately))
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
-                        clip_grads(model, 1.0, flag_on(args.clip_scorer_separately))
+                        clip_grads(model, 1.0, flag_on(args.clip_ranker_separately))
                         optimizer.step()
                     if scheduler is not None:
                         scheduler.step()
                 else:
+                    _m = model.module if hasattr(model, 'module') else model
                     print(f"Bad loss at epoch {epoch}, batch {batch_index}: "
                           f"total={loss.item():.4f}, diff={diffusion_loss.item():.4f}, "
                           f"refiner={refiner_loss.item():.4f}, goal={goal_loss.item():.4f}, "
-                          f"goal_best={goal_recon_loss.item():.4f}")
+                          f"goal_best={goal_recon_loss.item():.4f}, "
+                          f"ranker={_m.last_ranker_loss.item():.4f}")
                     optimizer.zero_grad()
                     continue
 
@@ -584,16 +603,14 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                     recorder["goal_loss"].update(goal_loss.item(), num_of_sample)
                     recorder["goal_recon_loss"].update(goal_recon_loss.item(), num_of_sample)
 
-                    # Scorer: stashed on the model rather than returned, so
+                    # Ranker: stashed on the model rather than returned, so
                     # forward()'s signature stays as train/test scripts expect.
-                    # Only set while training with the scorer enabled.
+                    # Only set while training.
                     if is_train:
                         _m = model.module if hasattr(model, 'module') else model
-                        if getattr(_m, "last_scorer_cls", None) is not None:
-                            recorder["scorer_cls"].update(_m.last_scorer_cls.item(), num_of_sample)
-                            if getattr(_m, "last_scorer_err", None) is not None:    # ModeScorer only
-                                recorder["scorer_err"].update(_m.last_scorer_err.item(), num_of_sample)
-                        # The switched-on map penalties (unweighted), stashed like the scorer's
+                        if getattr(_m, "last_ranker_loss", None) is not None:
+                            recorder["ranker_loss"].update(_m.last_ranker_loss.item(), num_of_sample)
+                        # The switched-on map penalties (unweighted), stashed like the ranker's
                         for part, value in getattr(_m, "last_map_penalties", {}).items():
                             recorder.setdefault(f"map_{part}", AverageMeter()).update(value.item(), num_of_sample)
 
@@ -628,7 +645,8 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                             now_labels = label_pos_lis[type_mask].cpu().numpy()
                             now_masks = label_mask_lis[type_mask].cpu().numpy()
                             
-                            # Chains are confidence-sorted by the model; index 0 = most-confident mode
+                            # Chains are sorted by the ranker; index 0 = its pick, which ADE/FDE
+                            # read. minADE/minFDE take the best of all K, whatever the order
                             best_pred = now_preds[:, 0, :, :]
 
                             # Ranking quality at the full horizon. Chains arrive
@@ -636,13 +654,16 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                             # the truly-best chain's index is its rank.
                             if not is_train:
                                 ade_k = np.linalg.norm(
-                                    now_preds - now_labels[:, None], axis=-1).mean(-1)
+                                    now_preds - now_labels[:, None], axis=-1).mean(-1) * SCALE_FACTOR
                                 rank_of_best = ade_k.argmin(1)
                                 n_ag = ade_k.shape[0]
                                 recorder["hit1"].update(
                                     float((rank_of_best == 0).mean()) * 100.0, n_ag)
                                 recorder["meanrank"].update(
                                     float(rank_of_best.mean()), n_ag)
+                                recorder["rank_top1_ade"].update(float(ade_k[:, 0].mean()), n_ag)
+                                recorder["rank_rand_ade"].update(float(ade_k.mean()), n_ag)
+                                recorder["rank_orac_ade"].update(float(ade_k.min(1).mean()), n_ag)
 
                             for length_idx, length in enumerate(length_lis):
                                 res, cnt = cal_ade_fde(
@@ -674,14 +695,10 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                         print_text += f"Refiner: {recorder['refiner_loss'].avg:.6f}, "
                         print_text += f"Goal: {recorder['goal_loss'].avg:.6f}, "
                         print_text += f"GoalBest: {recorder['goal_recon_loss'].avg:.6f}, "
-                        if recorder["scorer_cls"].count > 0:
+                        if recorder["ranker_loss"].count > 0:
                             gated = model_ref_log.goal_curriculum_alpha >= 1.0
-                            if recorder["scorer_err"].count > 0:      # ModeScorer: CE / error regression
-                                scorer_text = (f"Scorer(ce/err): {recorder['scorer_cls'].avg:.3f}/"
-                                               f"{recorder['scorer_err'].avg:.3f}")
-                            else:                                       # TrajScorer: KL to the soft target
-                                scorer_text = f"Scorer(kl): {recorder['scorer_cls'].avg:.3f}"
-                            print_text += scorer_text + f"{'' if gated else ' [not applied yet]'}, "
+                            print_text += (f"Ranker: {recorder['ranker_loss'].avg:.3f}"
+                                           f"{'' if gated else ' [not applied yet]'}, ")
                         map_parts = [part for part in ("goal", "diffusion", "refiner") if f"map_{part}" in recorder]
                         if map_parts:
                             print_text += ("MapPenalty(" + "/".join(map_parts) + "): "
@@ -703,10 +720,8 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                             writer.add_scalar('Train_Epoch/refiner_loss', recorder["refiner_loss"].avg, epoch)
                             writer.add_scalar('Train_Epoch/goal_loss', recorder["goal_loss"].avg, epoch)
                             writer.add_scalar('Train_Epoch/goal_recon_loss', recorder["goal_recon_loss"].avg, epoch)
-                            if recorder["scorer_cls"].count > 0:
-                                writer.add_scalar('Train_Epoch/scorer_cls', recorder["scorer_cls"].avg, epoch)
-                                if recorder["scorer_err"].count > 0:
-                                    writer.add_scalar('Train_Epoch/scorer_err', recorder["scorer_err"].avg, epoch)
+                            if recorder["ranker_loss"].count > 0:
+                                writer.add_scalar('Train_Epoch/ranker_loss', recorder["ranker_loss"].avg, epoch)
                             for part in ("goal", "diffusion", "refiner"):
                                 if f"map_{part}" in recorder:
                                     writer.add_scalar(f'Train_Epoch/map_{part}_penalty', recorder[f"map_{part}"].avg, epoch)
@@ -722,10 +737,12 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
                         recorder["refiner_loss"] = AverageMeter()
                         recorder["goal_loss"] = AverageMeter()
                         recorder["goal_recon_loss"] = AverageMeter()
-                        recorder["scorer_cls"] = AverageMeter()
-                        recorder["scorer_err"] = AverageMeter()
+                        recorder["ranker_loss"] = AverageMeter()
                         recorder["hit1"] = AverageMeter()
                         recorder["meanrank"] = AverageMeter()
+                        recorder["rank_top1_ade"] = AverageMeter()
+                        recorder["rank_rand_ade"] = AverageMeter()
+                        recorder["rank_orac_ade"] = AverageMeter()
 
                         # Run validation
                         if gpu_count > 1:
@@ -786,20 +803,25 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
         print(f"Loss: {recorder['loss'].avg:.6f}")
         print(f"  Diffusion Loss: {recorder['diffusion_loss'].avg:.6f}")
         print(f"  Refiner Loss:   {recorder['refiner_loss'].avg:.6f}")
-        print(f"  Goal Loss (WTA+CE): {recorder['goal_loss'].avg:.6f}")
+        print(f"  Goal Loss (WTA): {recorder['goal_loss'].avg:.6f}")
         # goal_recon_loss is the per-coordinate mean of squared errors, so the
         # Euclidean pixel RMSE is sqrt(2 * loss) * SCALE_FACTOR
         print(f"  Best-Head Goal Error (RMSE={(2*recorder['goal_recon_loss'].avg)**0.5*50:.2f}px): {recorder['goal_recon_loss'].avg:.6f}")
         print(f"{'-'*80}")
-        # Scorer ranking quality. K chains -> chance hit@1 = 100/K, chance
-        # meanRank = (K-1)/2. This is the number that says whether the scorer
-        # is doing anything; `ade` vs `min_ade` below is the same story in px.
+        # Ranker quality. K chains -> chance hit@1 = 100/K, chance meanRank =
+        # (K-1)/2. "gap closed" is the share of the random-chain-to-best-chain
+        # ADE gap the ranker's pick covers (full horizon, every val trajectory
+        # once), so it stays comparable while the generator itself changes.
         if recorder["hit1"].count > 0:
             n_modes = getattr(model_ref, 'num_samples', 20)
-            print(f"Scorer ranking:  hit@1 = {recorder['hit1'].avg:.1f}%  "
+            rand_ade, orac_ade = recorder["rank_rand_ade"].avg, recorder["rank_orac_ade"].avg
+            gap_closed = (100.0 * (rand_ade - recorder["rank_top1_ade"].avg) / (rand_ade - orac_ade)
+                          if rand_ade - orac_ade > 1e-9 else 0.0)
+            print(f"Ranker:  hit@1 = {recorder['hit1'].avg:.1f}%  "
                   f"(chance {100.0/n_modes:.1f}%)   "
                   f"meanRank = {recorder['meanrank'].avg:.2f}  "
-                  f"(chance {(n_modes-1)/2:.1f})")
+                  f"(chance {(n_modes-1)/2:.1f})   "
+                  f"gap closed = {gap_closed:.1f}%")
             print(f"{'-'*80}")
         print(f"Averaged Metrics (pixels, scale={SCALE_FACTOR}):")
         for k, v in print_dic.items():
@@ -816,6 +838,7 @@ def run_model(dataloader, num_sample, model, optimizer, scheduler, epoch, gpu, g
             if recorder["hit1"].count > 0:
                 writer.add_scalar('Val/scorer_hit1', recorder["hit1"].avg, epoch)
                 writer.add_scalar('Val/scorer_meanrank', recorder["meanrank"].avg, epoch)
+                writer.add_scalar('Val/ranker_gap_closed', gap_closed, epoch)
             for metric_type in metric_type_lis:
                 writer.add_scalar(f'Val/{metric_type}_pixels', print_dic[metric_type], epoch)
             for agent_type in agent_type_lis:
