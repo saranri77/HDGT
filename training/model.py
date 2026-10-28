@@ -2038,6 +2038,8 @@ class HDGT_model(nn.Module):
         # The ranker's target, per-chain ADE, is in PIXELS, the unit rank_loss's
         # temperatures are written in. train.py passes the dataset's scale.
         self.ranker_pixel_scale = float(getattr(args, 'scale_factor', 50.0))
+        # finetune_ranker.py sets this: _rank_chains then keeps its inputs
+        self.keep_rank_inputs = False
 
     def _rank_chains(self, diffusion_samples, all_refined_steps, goals, obs_trajectories,
                      target_agent_ids, target_agent_types, input_dic):
@@ -2083,6 +2085,11 @@ class HDGT_model(nn.Module):
             ctx, ctx_mask = self.diffusion_decoder.get_context_features(
                 target_agent_ids, input_dic)
 
+        if self.keep_rank_inputs:
+            # For finetune_ranker.py: this call's exact ranker inputs, so the
+            # ranker can be fit on the very chains inference ranks
+            self.last_rank_inputs = dict(state=state, geom=geom, agent_types=target_agent_types,
+                                         ctx=ctx, ctx_mask=ctx_mask, positions=positions)
         err_score, log_ade = self.ranker(state, geom, target_agent_types, ctx, ctx_mask)
         return positions, err_score, log_ade
 
