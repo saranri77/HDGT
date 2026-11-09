@@ -31,15 +31,16 @@ Map elements (hand-annotated with draw_shapes.py):
   draw_shapes.py for the geometry convention.
 - Classes: grass (pedestrians may walk on it, nobody else may) and obstacle
   (nobody may be inside it).
-- Every sample's graph gets its video's shapes as "map" nodes, with map->agent
-  and map->map edges. Map nodes are context only: nothing is predicted for them.
+- With --use_map_nodes True every sample's graph gets its video's shapes as
+  "map" nodes, with map->agent and map->map edges (as in hdgt_map_gnn). Map
+  nodes are context only: nothing is predicted for them. Off by default.
 - A car, bus or cart whose every position in the video is inside the drawn
   obstacles is parked: that obstacle is how it is seen, and it is NOT an agent,
   so nothing is predicted for it either (see PARKED_TYPES).
-- The collate fn also hands the model each target agent's forbidden shapes in
-  that agent's own frame, for the optional map penalties on goals and
-  trajectories (all off by default: the map reaches the model through the
-  graph only).
+- The collate fn always hands the model each target agent's shapes in that
+  agent's own frame (geometry, class, forbidden for its type) and the image
+  border, for the goal predictor's map crop and reachability prior and for
+  test_sdd.py's MAP COMPLIANCE block (hdgt_goal_heatmap).
 """
 
 import os
@@ -434,6 +435,7 @@ def scene_map_with_parked(scene_map, parked_geom):
     src, dst, fea = _m2m_edges_touching_new(geom, n_static)
     return {
         "scene_id": scene_map["scene_id"],
+        "img_geom": scene_map["img_geom"],
         "geom": geom,
         "cls": np.concatenate([scene_map["cls"],
                                np.full(n_parked, MAP_OBSTACLE, np.int64)]),
@@ -551,8 +553,15 @@ def load_scene_map(shapes_folder, scene_id, scale_factor=SCALE_FACTOR):
 
     cls = np.array([MAP_LABEL_TO_CLASS[l] for l in df["label"].values], dtype=np.int64)
     m2m_src, m2m_dst, m2m_fea = build_map_map_edges(geom)
+    # The image border as one more rectangle (world, SCALED), for "inside the image"
+    img_w, img_h = float(df["imgW"].iloc[0]), float(df["imgH"].iloc[0])
+    if not (np.isfinite(img_w) and np.isfinite(img_h) and img_w > 0 and img_h > 0):
+        raise ValueError(f"{path}: no image size (imgW, imgH)")
+    img_geom = np.array([img_w / 2, img_h / 2, img_w / 2, img_h / 2, 0.0, 0.0]) / np.array(
+        [scale_factor, scale_factor, scale_factor, scale_factor, 1.0, 1.0])
     return {
         "scene_id": scene_id,
+        "img_geom": img_geom,                           # (6,) world, SCALED: the image border
         "geom": geom,                                   # (S, 6) world, SCALED
         "cls": cls,                                     # (S,) 0 grass / 1 obstacle
         "shape_id": df["shapeId"].values.astype(np.int64),
@@ -1148,6 +1157,18 @@ def build_map_loss_geometry(scene_map, target_types, ref_coor, ref_psi, gt_pos,
     return geom.astype(np.float32), forbid, forbid & ~gt_touches
 
 
+def image_rect_geometry(scene_map, ref_coor, ref_psi):
+    """(A, MAP_LOSS_GEOM_DIM) the image border as a rectangle in each target's own frame,
+    [cx, cy, half_w, half_h, cos, sin, is_circle], like build_map_loss_geometry's rows"""
+    g = scene_map["img_geom"]
+    psi = np.asarray(ref_psi, dtype=np.float64).reshape(-1)
+    d = g[np.newaxis, :2] - ref_coor                                   # (A, 2)
+    c, s = np.cos(-psi), np.sin(-psi)
+    return np.stack([d[:, 0] * c - d[:, 1] * s, d[:, 1] * c + d[:, 0] * s,
+                     np.full(len(psi), g[G_HW]), np.full(len(psi), g[G_HH]),
+                     np.cos(-psi), np.sin(-psi), np.zeros(len(psi))], axis=-1).astype(np.float32)
+
+
 def rotate(data, cos_theta, sin_theta):
     """Rotate 2D coordinates"""
     x_new = data[..., 0] * cos_theta - data[..., 1] * sin_theta
@@ -1231,7 +1252,7 @@ def SDD_collate_fn(batch, args, is_train):
     agent_drop = args.agent_drop if hasattr(args, 'agent_drop') else 0.0
     # Map nodes/edges in the graph. The map loss geometry below is built either
     # way (it is cheap), so the map penalties and metrics work without them too.
-    use_map = bool(getattr(args, 'use_map', False))
+    use_map = getattr(args, 'use_map_nodes', False) in (True, 'True', 'true', '1')
     map_margin = 0.0   # a point outside every shape is never penalised
 
     scene_map_lis = [item["scene_map"] for item in batch]
@@ -1274,6 +1295,8 @@ def SDD_collate_fn(batch, args, is_train):
     out_map_geom_lis = []
     out_map_forbid_lis = []
     out_map_loss_lis = []
+    out_map_cls_lis = []
+    out_map_img_lis = []
 
     for i in range(len(agent_feature_lis)):
         # Compute agent map size (values are already in SCALED coordinates)
@@ -1427,12 +1450,15 @@ def SDD_collate_fn(batch, args, is_train):
         out_map_geom_lis.append(map_geom)
         out_map_forbid_lis.append(map_forbid)
         out_map_loss_lis.append(map_loss)
+        # Each shape's class (0 grass, 1 obstacle) for every target, and the image border
+        out_map_cls_lis.append(np.broadcast_to(now_scene_map["cls"], map_forbid.shape).astype(np.int64))
+        out_map_img_lis.append(image_rect_geometry(now_scene_map, ref_coor, ref_psi[:, 0]))
 
     # Batch everything
     output_dic = {}
     output_dic["cuda_tensor_lis"] = [
         "graph_lis", "label_lis", "label_pos_lis", "goal_pos_lis", "label_mask_lis",
-        "map_geom_lis", "map_forbid_mask_lis", "map_loss_mask_lis",
+        "map_geom_lis", "map_forbid_mask_lis", "map_loss_mask_lis", "map_cls_lis", "map_img_lis",
     ]
 
     # Map penalty geometry, one row per target agent, padded to the largest
@@ -1450,6 +1476,11 @@ def SDD_collate_fn(batch, args, is_train):
     output_dic["map_forbid_mask_lis"] = torch.as_tensor(np.concatenate(forbid_pad, axis=0))
     # (N, S) off limits AND not entered by the agent's own GT (for the loss)
     output_dic["map_loss_mask_lis"] = torch.as_tensor(np.concatenate(loss_pad, axis=0))
+    # (N, S) each shape's class, 0 grass / 1 obstacle; -1 on padding
+    output_dic["map_cls_lis"] = torch.as_tensor(np.concatenate(
+        [np.pad(c, ((0, 0), (0, s_max - c.shape[1])), constant_values=-1) for c in out_map_cls_lis], axis=0))
+    # (N, 7) the image border as a rectangle in each target's frame (same columns as map_geom_lis)
+    output_dic["map_img_lis"] = torch.as_tensor(np.concatenate(out_map_img_lis, axis=0))
 
     # Velocity labels for diffusion training (SCALED, per-frame)
     output_dic["label_lis"] = torch.as_tensor(np.concatenate(out_label_vel_lis, axis=0).astype(np.float32))
