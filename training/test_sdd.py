@@ -8,17 +8,22 @@ metrics report as <checkpoint>_<split>_report.txt next to the checkpoint.
 Defaults to the VAL split (the 8 VAL_VIDEOS held out of the train folder).
 The test folder is the final holdout: run it once, at the end, with --split test.
 
-The report adds a GOAL HEAD block (the K goals in slot order: usage, collapse,
-very-off goals), with the goal distribution (hdgt_goal_heatmap) a GOAL
-DISTRIBUTION block (how much probability the true goal gets, peaks, spread,
-best-of-k by rank, misses, tails), and a MAP COMPLIANCE block (paths entering
-shapes their agent may not enter). --goal_pick and its settings override how a
-goal-distribution checkpoint picks its K goals, to tune on val without
-retraining. With --baseline_checkpoint (e.g. a WTA checkpoint of hdgt_goal or
-hdgt_goal_sinkhorn; mtp and map nodes are read from its weights) both
-checkpoints are evaluated on the same trajectories with the same sampling
-noise, and a GOAL PREDICTOR vs BASELINE block says, metric by metric and per
-agent type with a paired bootstrap, whether the new goal predictor is better.
+The model is rebuilt as trained: its components (goal predictor, diffusion, refiner, ranker,
+map nodes), the goal distribution's settings, the ranker's settings and the bus setting are
+read from the checkpoint (hdgt_full's, or hdgt_RankNN's: K WTA heads + ranker). ADE/FDE are the
+ranker's first chain (without a ranker: the most likely goal's chain), minADE/minFDE the best of
+the K. The report adds RANKER RESULTS (with a ranker), GOAL HEAD (the K goals in slot order:
+usage, collapse, very-off goals), GOAL DISTRIBUTION (goal distribution only: how much
+probability the true goal gets, peaks, spread, best-of-k by rank, misses, tails) and MAP
+COMPLIANCE (paths entering shapes their agent may not enter).
+
+--goal_pick and its settings override how a goal distribution picks its K goals (tune on val
+without retraining; the report gets its own name). --bus_as_car True tries buses through the car
+weights on a checkpoint trained without it. --biker_top1_mean True gives bikers' ADE/FDE as the
+first chain averaged with its 2 nearest (hdgt_RankNN's option; minADE/minFDE keep the K chains).
+With --baseline_checkpoint (hdgt_full or hdgt_RankNN) both checkpoints are evaluated on the same
+trajectories with the same sampling noise, and a GOAL PREDICTOR vs BASELINE block says, metric by
+metric and per agent type with a paired bootstrap, whether the new one is better.
 
 Usage:
     python test_sdd.py --checkpoint logs/Hdgt_goal_DATE/snapshot/best_min_fde.pt
@@ -46,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["DGLBACKEND"] = "pytorch"
 
 from sdd_dataset import (SDDDataset, SDD_collate_fn, SCALE_FACTOR, AGENT_TYPE_NAMES,
-                         resolve_split_files)
+                         resolve_split_files, rank_image_settings)
 from sdd_dataset import BalancedBatchSampler
 
 
@@ -110,25 +115,25 @@ class AverageMeter:
         self.avg = self.sum / self.count if self.count > 0 else 0
 
 
-def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_desc):
-    """The SCORER RESULTS block of the report: how well the scorer orders the K chains"""
+def ranker_block(ranker_rows, agent_type_lis, num_prediction, pred_len, ranker_desc):
+    """The RANKER RESULTS block of the report: how well the ranker orders the K chains"""
     K = num_prediction
-    rows = {at: scorer_rows[at] for at in agent_type_lis if scorer_rows[at]}
+    rows = {at: ranker_rows[at] for at in agent_type_lis if ranker_rows[at]}
     rows = {"ALL": [r for at in rows for r in rows[at]], **rows}
 
     def cat(rs, key):
         return np.concatenate([r[key] for r in rs], axis=0)
 
     lines = [
-        f"SCORER RESULTS  ({scorer_desc}, {pred_len} steps = {pred_len * 0.4:.1f}s, pixels)",
+        f"RANKER RESULTS  ({ranker_desc}, {pred_len} steps = {pred_len * 0.4:.1f}s, pixels)",
         "-" * 80,
-        "  The scorer sorts the K chains; its first chain gives ADE and FDE above.",
-        "  hit@n    : % of trajectories whose best chain is among the scorer's first n",
-        "  meanRank : mean position of the best chain in the scorer's order (0 = first)",
-        "  picked   : error of the scorer's first chain      random: mean error over the K chains",
+        "  The ranker sorts the K chains; its first chain gives ADE and FDE above.",
+        "  hit@n    : % of trajectories whose best chain is among the ranker's first n",
+        "  meanRank : mean position of the best chain in the ranker's order (0 = first)",
+        "  picked   : error of the ranker's first chain      random: mean error over the K chains",
         "  goal     : error of the chain whose goal is closest to the true goal",
         "  best     : error of the best chain (minADE / minFDE)",
-        "  closed   : share of the random-to-best gap the scorer closes, (random-picked)/(random-best)",
+        "  closed   : share of the random-to-best gap the ranker closes, (random-picked)/(random-best)",
         f"  chance   : hit@1 {100 / K:.1f}%, hit@3 {min(300 / K, 100):.1f}%, hit@5 {min(500 / K, 100):.1f}%, "
         f"meanRank {(K - 1) / 2:.1f}, closed 0%",
     ]
@@ -142,7 +147,7 @@ def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_d
             if valid.sum() == 0:
                 continue
             err = err[valid]
-            rank = err.argmin(axis=1)            # chains come in the scorer's order
+            rank = err.argmin(axis=1)            # chains come in the ranker's order
             picked, random_, best = err[:, 0].mean(), err.mean(axis=1).mean(), err.min(axis=1).mean()
             has_goal = valid & ~np.isnan(goal_dist).any(axis=1)
             goal_text = "--"
@@ -155,30 +160,18 @@ def scorer_block(scorer_rows, agent_type_lis, num_prediction, pred_len, scorer_d
                 f"{(rank < 5).mean() * 100:>7.1f}%{rank.mean():>10.2f}{picked:>9.3f}{random_:>9.3f}"
                 f"{goal_text:>9}{best:>9.3f}{closed:>7.1f}%")
 
-    # Confidence, over every trajectory
-    ade, probs = cat(rows["ALL"], "ade"), cat(rows["ALL"], "probs")
+    # The ranker's absolute error estimate for its picked chain, over every trajectory
+    ade = cat(rows["ALL"], "ade")
     valid = ~np.isnan(ade).any(axis=1)
-    ade, probs = ade[valid], probs[valid]
-    rank = ade.argmin(axis=1)
-    entropy = -(probs * np.log(np.clip(probs, 1e-12, None))).sum(axis=1) / np.log(K)
+    pred_err = cat(rows["ALL"], "pred_err")[valid][:, 0]
+    actual = ade[valid][:, 0]
+    corr = float(np.corrcoef(pred_err, actual)[0, 1]) if len(actual) > 1 else float("nan")
     lines += [
         "",
-        "  Confidence (the scorer's softmax over the K chains, every trajectory):",
-        f"    picked chain : mean probability {probs[:, 0].mean():.3f}; it is the lowest-ADE chain "
-        f"{(rank == 0).mean() * 100:.1f}% of the time",
-        f"    best chain   : mean probability {probs[np.arange(len(rank)), rank].mean():.3f}  "
-        f"(uniform {1 / K:.3f})",
-        f"    spread       : normalised entropy {entropy.mean():.3f}  (1 = uniform over the K, 0 = all on one chain)",
+        "  Ranker error head (its predicted ADE for the picked chain, every trajectory):",
+        f"    predicted {pred_err.mean():.3f} px vs actual {actual.mean():.3f} px  "
+        f"(bias {pred_err.mean() - actual.mean():+.3f} px, correlation {corr:.3f})",
     ]
-    if rows["ALL"][0]["pred_err"] is not None:
-        pred_err = cat(rows["ALL"], "pred_err")[valid][:, 0]
-        actual = ade[:, 0]
-        corr = float(np.corrcoef(pred_err, actual)[0, 1]) if len(actual) > 1 else float("nan")
-        lines += [
-            "  ModeScorer error head (its predicted ADE for the picked chain):",
-            f"    predicted {pred_err.mean():.3f} px vs actual {actual.mean():.3f} px  "
-            f"(bias {pred_err.mean() - actual.mean():+.3f} px, correlation {corr:.3f})",
-        ]
     lines += ["=" * 80]
     return lines
 
@@ -213,9 +206,10 @@ COMPARE_METRICS = (
     ("fde", "FDE, first chain (px)", "lower", "top-1"),
     ("first", "first chain's goal error (px)", "lower", "top-1"),
     ("hit1", "hit@1, lowest-ADE chain first (%)", "higher", "top-1"),
-    ("conf", "conf head's top goal error (px)", "lower", "top-1"),
+    ("conf", "most likely goal's error (px)", "lower", "top-1"),
 )
 COMPARE_GROUPS = ("dead heads", "collapse", "off goals", "goal accuracy", "coverage", "candidates", "top-1")
+GOAL_GROUPS = ("dead heads", "collapse", "off goals", "goal accuracy")
 CHAIN_KEYS = ("min_ade", "min_fde", "random_ade", "random_fde", "ade", "fde", "hit1")
 MIN_TRAJ_FOR_VERDICT = 10   # an agent type with fewer trajectories is shown, not judged
 OVERALL_TEXT = {
@@ -252,7 +246,7 @@ def map_block(map_rows, agent_type_lis):
             continue
         chains = np.concatenate([r["chains"] for r in rows[name]], axis=0)   # (M, K) deepest point, px
         gt = np.concatenate([r["gt"] for r in rows[name]], axis=0)           # (M,)
-        top1 = chains[:, 0]
+        top1 = np.concatenate([r["top1"] for r in rows[name]], axis=0)       # (M,) the single answer
         entering = top1 > inside_px
         depth = top1[entering].mean() if entering.any() else 0.0
         lines.append(f"  {name:<12}{len(gt):>6}{100 * (gt > inside_px).mean():>8.1f}%"
@@ -324,13 +318,6 @@ def distribution_block(goal, dist, agent_type_lis, scale_factor):
     return lines
 
 
-def scorer_of(checkpoint):
-    """The scorer a checkpoint was trained with, read from its weights: 'traj' (traj_scorer.*),
-    'mode' (mode_scorer.*) or None"""
-    return next((kind for kind, prefix in (("traj", "traj_scorer."), ("mode", "mode_scorer."))
-                 if any(k.startswith(prefix) for k in checkpoint["model_state_dict"])), None)
-
-
 GOAL_ARG_DEFAULTS = {  # train.py's defaults, for checkpoints whose args lack a flag
     "goal_map_crop": "True", "goal_reach_prior": "True", "goal_grid_cells": 61, "goal_grid_range": 1.5,
     "goal_heatmap_sigma": 0.075, "goal_crop_cells": 32, "goal_hidden": 128, "goal_pick": "kmeans",
@@ -341,54 +328,92 @@ PICK_FLAGS = ("goal_pick", "goal_pick_iters", "goal_pick_alpha", "goal_pick_rese
               "goal_pick_floor")
 
 
+def flag_on(value):
+    """A flag that may arrive as a bool or as argparse's "True"/"False" string"""
+    return value in (True, "True", "true", "1")
+
+
+def has_weights(checkpoint, prefix):
+    return any(k.startswith(prefix) for k in checkpoint["model_state_dict"])
+
+
 def goal_predictor_of(checkpoint):
-    """'heatmap' or 'mtp', from the checkpoint's args, else from its weights"""
-    saved = checkpoint.get("args", {}).get("goal_predictor")
-    if saved in ("heatmap", "mtp"):
-        return saved
-    return "mtp" if "goal_predictor.goal_head.weight" in checkpoint["model_state_dict"] else "heatmap"
+    """'heatmap', 'mtp' or None (no goal predictor), from the checkpoint's args, else its weights"""
+    saved = checkpoint.get("args", {})
+    if "use_goal_predictor" in saved and not flag_on(saved["use_goal_predictor"]):
+        return None
+    if saved.get("goal_predictor") in ("heatmap", "mtp"):
+        return saved["goal_predictor"]
+    if "goal_predictor.goal_head.weight" in checkpoint["model_state_dict"]:
+        return "mtp"
+    return "heatmap" if has_weights(checkpoint, "goal_predictor.") else None
 
 
 def map_nodes_of(checkpoint):
     """Whether the checkpoint's encoder has map nodes (hdgt_map_gnn's encoder.map_emb weights)"""
-    return any(k.startswith("encoder.map_emb") for k in checkpoint["model_state_dict"])
+    return has_weights(checkpoint, "encoder.map_emb")
 
 
-def build_model(model_module, checkpoint, args, device, use_scorer=None, scorer_type=None, pick_override=None):
-    """The model rebuilt as the checkpoint was trained, in eval mode, and its scorer's name. The
-    scorer is read from the checkpoint's weights unless use_scorer / scorer_type are given; the
-    goal predictor, its settings and the map nodes from its args and weights; pick_override
-    {flag: value} replaces how a goal distribution picks its K goals. The class statistics behind
-    the s_n floors are loaded into the model (s_n scales the goal distribution's grid)"""
+def components_of(model_module, checkpoint):
+    """The model a checkpoint was trained as: its components, its ranker's settings and its bus
+    setting, from its saved args, else its weights (hdgt_RankNN's checkpoints too)"""
+    saved = checkpoint.get("args", {})
+    comp = {"goal_predictor": goal_predictor_of(checkpoint),
+            "use_diffusion": flag_on(saved.get("use_diffusion", has_weights(checkpoint, "diffusion_decoder."))),
+            "use_refiner": flag_on(saved.get("use_refiner", has_weights(checkpoint, "refiner."))),
+            "use_ranker": has_weights(checkpoint, "ranker."),
+            "use_map_nodes": map_nodes_of(checkpoint),
+            "bus_as_car": flag_on(saved.get("bus_as_car", False))}
+    comp.update(model_module.ranker_args_from_checkpoint(checkpoint))
+    return comp
+
+
+def ranker_desc_of(comp):
+    """The ranker, for the report"""
+    if not comp["use_ranker"]:
+        return "none (the chains keep the goal order, most likely goal first)"
+    clues = [name for name, on in (("map", comp["ranker_map"]), ("image", comp["ranker_image"])) if on]
+    return ((f"{comp['ranker_models']} TrajRankNNs, scores averaged" if comp["ranker_models"] > 1
+             else "TrajRankNN") + (f", with {' and '.join(clues)}" if clues else "") + ", trained with the model")
+
+
+def build_model(model_module, checkpoint, args, device, pick_override=None):
+    """The model rebuilt as the checkpoint was trained (components_of), in eval mode, and those
+    settings. pick_override {flag: value} replaces how a goal distribution picks its K goals.
+    The class statistics behind the s_n floors are loaded into the model (s_n scales the goal
+    distribution's grid)"""
     model_args = copy.copy(args)
-    in_weights = scorer_of(checkpoint)
-    model_args.use_scorer = use_scorer if use_scorer is not None else ("True" if in_weights else "False")
-    model_args.scorer_type = scorer_type if scorer_type is not None else (in_weights or "mode")
     saved = checkpoint.get("args", {})
     for key, default in GOAL_ARG_DEFAULTS.items():
         setattr(model_args, key, saved.get(key, default))
     for key, value in (pick_override or {}).items():
         setattr(model_args, key, value)
-    model_args.goal_predictor = goal_predictor_of(checkpoint)
-    model_args.use_map_nodes = map_nodes_of(checkpoint)
+    comp = components_of(model_module, checkpoint)
+    model_args.use_goal_predictor = comp["goal_predictor"] is not None
+    model_args.goal_predictor = comp["goal_predictor"] or "heatmap"
+    for key in ("use_diffusion", "use_refiner", "use_ranker", "use_map_nodes", "ranker_map", "ranker_image",
+                "ranker_image_size", "ranker_image_px", "ranker_models"):
+        setattr(model_args, key, comp[key])
+    model_args.scale_factor = SCALE_FACTOR
     model = model_module.HDGT_model(input_dim=8, args=model_args)
     model.load_state_dict(checkpoint["model_state_dict"])
     if "goal_class_scale" in checkpoint:
         model.goal_class_scale.load(checkpoint["goal_class_scale"], checkpoint.get("goal_class_count"))
-    elif model_args.goal_predictor == "heatmap":
+    elif model_args.use_goal_predictor and model_args.goal_predictor == "heatmap":
         raise RuntimeError("this goal-distribution checkpoint has no class statistics (goal_class_scale): "
                            "its s_n floors, and so its goal grid, cannot be rebuilt")
     model.to(device)
     model.eval()
-    scorer_desc = ({"mode": "ModeScorer", "traj": "TrajScorer"}.get(getattr(model, "scorer_type", None), "?")
-                   if getattr(model, "use_scorer", False) else "none (chains in goal order)")
-    return model, scorer_desc
+    return model, comp
 
 
 def goal_settings(checkpoint, pick_override=None):
     """The goal predictor a checkpoint was trained with, from its saved args and weights, for the report"""
     a = checkpoint.get("args", {})
-    if goal_predictor_of(checkpoint) == "heatmap":
+    kind = goal_predictor_of(checkpoint)
+    if kind is None:
+        return "none (--use_goal_predictor False: the chains are not goal-conditioned)"
+    if kind == "heatmap":
         g = {**GOAL_ARG_DEFAULTS, **{k: v for k, v in a.items() if k in GOAL_ARG_DEFAULTS}, **(pick_override or {})}
         pick = g["goal_pick"] + {"flat": f" (p^{g['goal_pick_alpha']})",
                                  "reserve": f" ({g['goal_pick_reserve']} for rare futures)",
@@ -399,15 +424,25 @@ def goal_settings(checkpoint, pick_override=None):
                 + (" [picking set on the command line]" if pick_override else ""))
     elif "goal_assign" in a:
         text = f"K WTA heads, trained in hdgt_goal_sinkhorn with --goal_assign {a['goal_assign']}"
-        if a["goal_assign"] == "hybrid":
-            text += f" (wta + {a.get('goal_sinkhorn_weight')} x sinkhorn)"
     else:
-        text = "K WTA heads (hdgt_goal's top-3 -> top-1)"
+        text = "K WTA heads (top-3 -> top-1)"
     if a.get("goal_detach_encoder", True) in (False, "False", "false", "0"):
         text += ", goal loss also trains the encoder"
     if float(a.get("goal_cond_noise", 0.0) or 0.0) > 0:
         text += f", decoder trained on noisy goals (RMS {a['goal_cond_noise']} s_n)"
     return text
+
+
+def penalty_settings(checkpoint):
+    """The map penalties a checkpoint was trained with, for the report"""
+    a = checkpoint.get("args", {})
+    parts = [p for p in ("goal", "diffusion", "refiner") if flag_on(a.get(p + "_map_penalty", False))]
+    if "use_map_penalty" in a and not flag_on(a["use_map_penalty"]):
+        parts = []
+    if not parts:
+        return "none"
+    return (", ".join(f"{p} (weight {a.get(p + '_map_penalty_weight', 0.1)})" for p in parts)
+            + f"; GT-entered shapes exempt: {a.get('map_penalty_gt_exempt', True)}")
 
 
 def checkpoint_floors(model_module, checkpoint):
@@ -429,7 +464,7 @@ def checkpoint_floors(model_module, checkpoint):
 def evaluate(model, model_module, loader, args, device, agent_type_lis, length_lis, metric_type_lis, floors):
     """One pass over the split. It reseeds first, so every pass draws the same sampling noise (a
     baseline's chains get the new checkpoint's noise). Returns the standard-metric meters, the
-    scorer rows (with a scorer) and, in batch order, the per-trajectory inputs of the GOAL HEAD
+    ranker rows (with a ranker) and, in batch order, the per-trajectory inputs of the GOAL HEAD
     diagnostics and of the comparison"""
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -444,10 +479,10 @@ def evaluate(model, model_module, loader, args, device, agent_type_lis, length_l
         for mt in metric_type_lis
     }
 
-    # Scorer results (only with a scorer): every chain's error at the full horizon, in the
-    # scorer's order, with the scorer's outputs for it. Per type, every trajectory counts once.
-    use_scorer = getattr(model, "use_scorer", False)
-    scorer_rows = {at: [] for at in agent_type_lis}
+    # Ranker results (with a ranker): every chain's error at the full horizon, in the ranker's
+    # order, with the ranker's outputs for it. Per type, every trajectory counts once.
+    use_ranker = getattr(model, "use_ranker", False)
+    ranker_rows = {at: [] for at in agent_type_lis}
     # GOAL HEAD rows: every target of every batch; GOAL DISTRIBUTION rows (goal distribution only)
     goal_rows = []
     dist_rows = []
@@ -490,12 +525,20 @@ def evaluate(model, model_module, loader, args, device, agent_type_lis, length_l
             if getattr(model, "last_goal_prob", None) is not None:
                 dist_rows.append(goal_distribution_rows(model, label_pos[:, -1]))
 
-            if use_scorer:
-                # All three come in the same order as the returned chains
-                goals_np = model.last_predicted_goals.cpu().numpy()                  # (N, K, 2)
-                probs_np = model.last_mode_probs.cpu().numpy()                       # (N, K)
-                perr = getattr(model, "last_pred_error", None)                       # ModeScorer only
-                perr_np = perr.cpu().numpy() * SCALE_FACTOR if perr is not None else None
+            # The single answer: chain 0, or for bikers with --biker_top1_mean its mean with the 2
+            # nearest chains
+            top1_t, depth_top1 = pos_t[:, 0], None
+            if args.biker_top1_mean:
+                is_biker = pred_bool_type_lis[agent_type_lis.index("BIKER")]
+                top1_t = torch.where(is_biker[:, None, None], model_module.mean_with_nearest(pos_t), top1_t)
+                depth_top1 = (model_module.map_depth(model_module.densify_path(top1_t), geom, forbid)
+                              .amax(dim=-1) * SCALE_FACTOR).cpu().numpy()           # (N,)
+            top1_np = top1_t.cpu().numpy()
+
+            if use_ranker:
+                # Both come in the same order as the returned chains
+                goals_np = model.last_predicted_goals.cpu().numpy()                      # (N, K, 2)
+                perr_np = model.last_pred_error.cpu().numpy()   # (N, K), already pixels: no SCALE_FACTOR
 
             # The goal heads in head order and every chain's error, for the GOAL HEAD block and the
             # comparison; s_n from the observed positions and the checkpoint's class floors
@@ -524,17 +567,20 @@ def evaluate(model, model_module, loader, args, device, agent_type_lis, length_l
                 labels = label_pos[mask].cpu().numpy()  # (M, pred_len, 2)
                 masks  = label_mask[mask].cpu().numpy() # (M, pred_len)
 
-                # Chain 0: the scorer's pick with a scorer; the most likely goal's chain without one
-                best_pred = preds[:, 0, :, :]
-                map_rows[at].append({"chains": depth_k[mask], "gt": depth_gt[mask]})
+                # The ranker's pick (chain 0; without a ranker the most likely goal's chain), or the
+                # bikers' mean of it and its 2 nearest
+                best_pred = top1_np[mask]
+                map_rows[at].append({"chains": depth_k[mask], "gt": depth_gt[mask],
+                                     "top1": depth_k[mask][:, 0] if depth_top1 is None else depth_top1[mask]})
 
-                if use_scorer:
+                if use_ranker:
                     ade_k, fde_k = chain_errors(preds, labels, masks, scale_factor=SCALE_FACTOR)
                     goal_dist = np.linalg.norm(goals_np[mask] - labels[:, -1][:, np.newaxis], axis=-1)
                     goal_dist[masks[:, -1] == 0] = np.nan    # no true goal without the last step
-                    scorer_rows[at].append({"ade": ade_k, "fde": fde_k, "goal_dist": goal_dist,
-                                            "probs": probs_np[mask],
-                                            "pred_err": perr_np[mask] if perr_np is not None else None})
+                    if not getattr(model, "use_goal_predictor", True):
+                        goal_dist[:] = np.nan                # no goals: the goal column is not shown
+                    ranker_rows[at].append({"ade": ade_k, "fde": fde_k, "goal_dist": goal_dist,
+                                            "pred_err": perr_np[mask]})
 
                 for ln in length_lis:
                     res, cnt = cal_ade_fde(
@@ -563,12 +609,12 @@ def evaluate(model, model_module, loader, args, device, agent_type_lis, length_l
                   else None) for key in goal_rows[0]}
     dist = ({key: np.concatenate([row[key] for row in dist_rows], axis=0) for key in dist_rows[0]}
             if dist_rows else None)
-    return {"recorder": recorder, "scorer_rows": scorer_rows, "goal": goal, "elapsed": elapsed_total,
-            "use_scorer": use_scorer, "scorer_type": getattr(model, "scorer_type", None),
+    return {"recorder": recorder, "ranker_rows": ranker_rows, "goal": goal, "elapsed": elapsed_total,
+            "use_ranker": use_ranker, "use_goal_predictor": getattr(model, "use_goal_predictor", True),
             "dist": dist, "map_rows": map_rows}
 
 
-def comparison_arrays(model_module, goal, valid, use_scorer, rho):
+def comparison_arrays(model_module, goal, valid, use_ranker, rho):
     """One pass's per-trajectory arrays for the comparison, over the trajectories `valid`: the
     goal-head ones (model.goal_head_agent_arrays) and the chain errors at the full horizon"""
     arrays = model_module.goal_head_agent_arrays(
@@ -580,8 +626,8 @@ def comparison_arrays(model_module, goal, valid, use_scorer, rho):
         "min_ade": ade.min(axis=1), "min_fde": fde.min(axis=1),
         "random_ade": ade.mean(axis=1), "random_fde": fde.mean(axis=1),
         "ade": ade[:, 0], "fde": fde[:, 0],
-        # a ranking measure, so only with a scorer (without one, chain 0 is just head 0)
-        "hit1": (ade.argmin(axis=1) == 0) * 100.0 if use_scorer else None,
+        # a ranking measure, so only with a ranker (without one, chain 0 is the most likely goal's)
+        "hit1": (ade.argmin(axis=1) == 0) * 100.0 if use_ranker else None,
     })
     return arrays
 
@@ -633,10 +679,11 @@ def overall_verdict(group_verdicts):
 
 
 def compare_lines(arrays_new, arrays_base, cls, model_module, agent_type_lis, split, pred_len,
-                  n_bootstrap, seed, new_info, base_info, same_ranking):
+                  n_bootstrap, seed, new_info, base_info, same_ranking, goals_ok=True):
     """The GOAL PREDICTOR vs BASELINE block. arrays_new / arrays_base: comparison_arrays of the two
     passes over the same trajectories, cls (n,) their agent types; new_info / base_info: (path,
-    description lines); same_ranking: both rank their chains the same way (the top-1 group)"""
+    description lines); same_ranking: both rank their chains the same way (the top-1 group);
+    goals_ok False (a model without a goal predictor): the goal metrics are not judged"""
     rng = np.random.default_rng(seed)
     tables = []
     for name, members in [("ALL", np.arange(len(cls)))] + [
@@ -645,8 +692,10 @@ def compare_lines(arrays_new, arrays_base, cls, model_module, agent_type_lis, sp
             continue
         s_new = comparison_summary(model_module, arrays_new, members)
         s_base = comparison_summary(model_module, arrays_base, members)
+        goal_metric = lambda key, group: group in GOAL_GROUPS or key in ("first", "conf")
         judged = [key for key, _, better, group in COMPARE_METRICS
                   if better is not None and (group != "top-1" or same_ranking)
+                  and (goals_ok or not goal_metric(key, group))
                   and s_new[key] is not None and s_base[key] is not None]
         # Paired bootstrap: the same resample of the trajectories for both checkpoints
         intervals = {}
@@ -701,8 +750,10 @@ def compare_lines(arrays_new, arrays_base, cls, model_module, agent_type_lis, sp
         "             NO CLEAR CHANGE if every group is the same, MIXED otherwise",
     ]
     if not same_ranking:
-        lines += ["  top-1    : not judged -- the two rank their chains differently (see their scorers), so",
-                  "             their first chains differ by construction, whatever the goal heads"]
+        lines += ["  top-1    : not judged -- one has a ranker and the other not, so their first chains",
+                  "             differ by construction, whatever the goals"]
+    if not goals_ok:
+        lines += ["  goals    : not judged -- a model without a goal predictor has no goals to compare"]
 
     widths = [max(len(group), 6) + 2 for group in COMPARE_GROUPS]
     lines += ["", "  Diagnosis (group verdicts; each group's metrics are in the tables below)",
@@ -861,9 +912,13 @@ def main():
     # Unused at test time but needed to instantiate the model
     parser.add_argument("--goal_loss_weight", type=float, default=0.5)
     parser.add_argument("--goal_curriculum_epochs", type=int, default=5)
-    # Scorer: read from the checkpoint's weights by default, so the model is rebuilt as trained
-    parser.add_argument("--use_scorer", type=str, default=None)
-    parser.add_argument("--scorer_type", type=str, default=None, choices=["mode", "traj"])
+    # Everything about the model (components, ranker, bus setting) is read from the checkpoint
+    # Buses through the car weights: the checkpoint's setting by default; True on a checkpoint
+    # trained without it tries that on the trained weights (the report gets its own name)
+    parser.add_argument("--bus_as_car", type=str, default=None)
+    # Bikers' single answer (ADE/FDE): the first chain averaged with its 2 nearest chains.
+    # Evaluation only; the K chains (minADE/minFDE) stay as returned
+    parser.add_argument("--biker_top1_mean", type=str, default="False")
     # The previous goal predictor, compared with --checkpoint (GOAL PREDICTOR vs BASELINE)
     # How a goal-distribution checkpoint picks its K goals: the checkpoint's own unless given
     parser.add_argument("--goal_pick", type=str, default=None, choices=["kmeans", "flat", "reserve", "sinkhorn"])
@@ -875,8 +930,7 @@ def main():
     parser.add_argument("--baseline_checkpoint", type=str, default=None,
                         help="checkpoint of the previous goal predictor, e.g. one of hdgt_goal's best_min_fde.pt "
                              "or a --goal_predictor mtp run (mtp and map nodes are read from its weights): evaluated on the same trajectories with "
-                             "the same noise and compared with --checkpoint. Its scorer is read from its weights; "
-                             "--use_scorer / --scorer_type apply to --checkpoint only")
+                             "the same noise and compared with --checkpoint. Everything about it is read from it")
     parser.add_argument("--n_bootstrap", type=int, default=1000,
                         help="paired bootstrap resamples behind the comparison's 95%% intervals")
 
@@ -920,25 +974,42 @@ def main():
               "from it are\n         optimistic. Retrain with --use_val_split True "
               "for a clean final result.")
 
-    # The scorer the checkpoint was trained with, read from its weights (traj_scorer.* =
-    # TrajScorer, mode_scorer.* = ModeScorer, neither = no scorer) unless given on the command line
+    # The model as trained: its components, the goal distribution's and the ranker's settings
     model_module = importlib.import_module(args.model_module)
     pick_override = {key: getattr(args, key) for key in PICK_FLAGS if getattr(args, key) is not None}
-    model, scorer_desc = build_model(model_module, checkpoint, args, device, args.use_scorer, args.scorer_type,
-                                     pick_override)
-    map_nodes = map_nodes_of(checkpoint)
+    model, comp = build_model(model_module, checkpoint, args, device, pick_override)
+    ranker_desc = ranker_desc_of(comp)
+    base_comp = None
     if args.baseline_checkpoint is not None:
-        map_nodes = map_nodes or map_nodes_of(torch.load(args.baseline_checkpoint, map_location="cpu"))
-    # The loader adds the map nodes to the graph when either model has them; a model without
-    # them reads only the agent nodes and edges
-    args.use_map_nodes = map_nodes
-    print(f"Model loaded — refiner={'ON' if args.use_refiner else 'OFF'}, scorer={scorer_desc}, K={args.num_prediction}")
+        base_comp = components_of(model_module, torch.load(args.baseline_checkpoint, map_location="cpu"))
+    # The loader: map nodes when either model has them (a model without them reads the agent
+    # nodes and edges only); the image patches when either ranker reads them; the bus setting the
+    # checkpoint was trained with unless --bus_as_car is given, and the baseline must agree
+    readers = [c for c in (comp, base_comp) if c is not None and c["use_ranker"] and c["ranker_image"]]
+    if len({(c["ranker_image_size"], c["ranker_image_px"]) for c in readers}) > 1:
+        print("ERROR: the two checkpoints' rankers read image patches of different sizes")
+        sys.exit(1)
+    args.use_map_nodes = comp["use_map_nodes"] or bool(base_comp and base_comp["use_map_nodes"])
+    args.ranker_image = bool(readers)
+    if readers:
+        args.ranker_image_size, args.ranker_image_px = readers[0]["ranker_image_size"], readers[0]["ranker_image_px"]
+    trained_bus_as_car = comp["bus_as_car"]
+    args.bus_as_car = trained_bus_as_car if args.bus_as_car is None else flag_on(args.bus_as_car)
+    if base_comp is not None and base_comp["bus_as_car"] != args.bus_as_car:
+        print(f"ERROR: the baseline was trained with --bus_as_car {base_comp['bus_as_car']}, the loader uses "
+              f"{args.bus_as_car}: pass --bus_as_car {base_comp['bus_as_car']} or compare checkpoints trained alike")
+        sys.exit(1)
+    args.biker_top1_mean = flag_on(args.biker_top1_mean)
+    on = lambda v: "ON" if v else "OFF"
+    print(f"Model loaded — goal predictor={comp['goal_predictor'] or 'OFF'}, diffusion={on(comp['use_diffusion'])}, "
+          f"refiner={on(comp['use_refiner'])}, ranker={ranker_desc}, map nodes={on(comp['use_map_nodes'])}, "
+          f"K={args.num_prediction}")
 
-    # The goal-head loss it was trained with, and the class floors of s_n (GOAL HEAD block)
+    # The goal predictor it was trained with, and the class floors of s_n (GOAL HEAD block)
     goal_desc = goal_settings(checkpoint, pick_override)
+    penalty_desc = penalty_settings(checkpoint)
     floors, floors_source = checkpoint_floors(model_module, checkpoint)
     rho = model_module.GOAL_CLOSE_RHO
-    model_map_nodes = map_nodes_of(checkpoint)
     print(f"Goal predictor: {goal_desc}")
     del checkpoint
 
@@ -962,7 +1033,8 @@ def main():
     for f in test_files:
         print(f"  {os.path.basename(f)}")
 
-    test_dataset = SDDDataset(test_files, obs_len=args.obs_len, pred_len=args.pred_len)
+    test_dataset = SDDDataset(test_files, obs_len=args.obs_len, pred_len=args.pred_len,
+                              rank_image=rank_image_settings(args))
     # Balanced batches as in the original HDGT, the same in every version: no shuffling, and the
     # left-over samples as a last batch, so every trajectory is evaluated
     test_sizes = np.array([sample['agent_feature'].shape[0] for sample in test_dataset.samples])
@@ -996,10 +1068,11 @@ def main():
         base_checkpoint = torch.load(args.baseline_checkpoint, map_location="cpu")
         base_epoch = base_checkpoint.get("epoch", "?")
         base_goal_desc = goal_settings(base_checkpoint)
-        # Its own scorer, from its weights
-        base_model, base_scorer_desc = build_model(model_module, base_checkpoint, args, device)
+        # Everything about it from itself
+        base_model, base_comp = build_model(model_module, base_checkpoint, args, device)
+        base_ranker_desc = ranker_desc_of(base_comp)
         del base_checkpoint
-        print(f"Baseline loaded — scorer={base_scorer_desc}; goal predictor: {base_goal_desc}")
+        print(f"Baseline loaded — ranker={base_ranker_desc}; goal predictor: {base_goal_desc}")
         base = evaluate(base_model, model_module, test_loader, args, device, agent_type_lis, length_lis,
                         metric_type_lis, floors)
         del base_model
@@ -1023,15 +1096,23 @@ def main():
         f"Eval samples: {len(test_dataset)}",
         f"Scale factor: {SCALE_FACTOR}  (metrics in original pixel coordinates)",
         f"K samples   : {args.num_prediction}",
-        f"Refiner     : {'ON' if args.use_refiner else 'OFF'}",
-        f"Scorer      : {scorer_desc}",
+        f"Refiner     : {'ON' if comp['use_refiner'] else 'OFF'}",
         f"Goal pred.  : {goal_desc}",
-        f"Map nodes   : {'ON (shapes in the encoder graph)' if model_map_nodes else 'OFF'}",
+        f"Diffusion   : {'ON' if comp['use_diffusion'] else 'OFF (the K chains start as straight lines to the goals; constant velocity without goals)'}",
+        f"Ranker      : {ranker_desc}",
+        f"Map nodes   : {'ON (shapes in the encoder graph)' if comp['use_map_nodes'] else 'OFF'}",
+        f"Map penalty : {penalty_desc} (in training)",
+        f"Buses       : {'through the car weights' if args.bus_as_car else 'their own weights'}"
+        + ("" if args.bus_as_car == trained_bus_as_car else
+           f" (trained with {'the car' if trained_bus_as_car else 'their own'} weights)"),
         f"s_n floors  : {floors_source}",
     ]
     if base is not None:
         lines.append(f"Baseline    : {os.path.abspath(args.baseline_checkpoint)}  "
                      f"(see GOAL PREDICTOR vs BASELINE)")
+    if args.biker_top1_mean:
+        lines += ["Top-1       : bikers: the first chain averaged with its 2 nearest",
+                  "              (ADE/FDE and map top-1; the ranker table keeps its first chain)"]
     lines += [
         f"Random seed : {args.seed}",
         f"Eval time   : {new['elapsed']:.1f}s",
@@ -1042,16 +1123,16 @@ def main():
                               {"ADE": "ade", "FDE": "fde", "minADE": "min_ade", "minFDE": "min_fde"},
                               args.num_prediction, args.split)
 
-    if new["use_scorer"]:
-        lines += scorer_block(new["scorer_rows"], agent_type_lis, args.num_prediction, args.pred_len, scorer_desc)
+    if new["use_ranker"]:
+        lines += ranker_block(new["ranker_rows"], agent_type_lis, args.num_prediction, args.pred_len, ranker_desc)
     lines += map_block(new["map_rows"], agent_type_lis)
 
     # GOAL HEAD: the checkpoint's K goal heads (every trajectory with a true goal)
     goal = new["goal"]
     valid = goal["goal_valid"]
-    first_desc = ("the scorer's pick" if new["use_scorer"]
-                  else "slot 0: without a scorer the chains keep the goal order")
-    if valid.any():
+    first_desc = ("the ranker's pick" if new["use_ranker"]
+                  else "slot 0: without a ranker the chains keep the goal order")
+    if valid.any() and new["use_goal_predictor"]:
         diagnostics = model_module.goal_head_diagnostics(
             goal["goals"][valid], goal["gt"][valid], goal["s"][valid], goal["cls"][valid], agent_type_lis,
             SCALE_FACTOR, first_goal=goal["first"][valid],
@@ -1071,19 +1152,18 @@ def main():
                                    f"('{key}' differs); the comparison would be meaningless.")
         valid = (goal["goal_valid"] & ~np.isnan(goal["ade"]).any(axis=1) & ~np.isnan(goal["fde"]).any(axis=1)
                  & ~np.isnan(base_goal["ade"]).any(axis=1) & ~np.isnan(base_goal["fde"]).any(axis=1))
-        same_ranking = (new["use_scorer"] == base["use_scorer"]
-                        and (not new["use_scorer"] or new["scorer_type"] == base["scorer_type"]))
+        same_ranking = new["use_ranker"] == base["use_ranker"]
         lines += compare_lines(
-            comparison_arrays(model_module, goal, valid, new["use_scorer"], rho),
-            comparison_arrays(model_module, base_goal, valid, base["use_scorer"], rho),
+            comparison_arrays(model_module, goal, valid, new["use_ranker"], rho),
+            comparison_arrays(model_module, base_goal, valid, base["use_ranker"], rho),
             goal["cls"][valid], model_module, agent_type_lis, args.split, args.pred_len,
             args.n_bootstrap, args.seed,
-            (os.path.abspath(args.checkpoint), [f"epoch {saved_epoch}; scorer: {scorer_desc}",
+            (os.path.abspath(args.checkpoint), [f"epoch {saved_epoch}; ranker: {ranker_desc}",
                                                 f"goal predictor: {goal_desc}"]),
-            (os.path.abspath(args.baseline_checkpoint), [f"epoch {base_epoch}; scorer: {base_scorer_desc}",
+            (os.path.abspath(args.baseline_checkpoint), [f"epoch {base_epoch}; ranker: {base_ranker_desc}",
                                                          f"goal predictor: {base_goal_desc}",
                                                          f"eval time {base['elapsed']:.1f}s"]),
-            same_ranking)
+            same_ranking, goals_ok=new["use_goal_predictor"] and base["use_goal_predictor"])
 
     report = "\n".join(lines)
 
@@ -1094,7 +1174,13 @@ def main():
 
     save_dir  = os.path.dirname(os.path.abspath(args.checkpoint))
     # One file per split, so a val run never overwrites the final test report
-    save_path = os.path.join(save_dir, f"{os.path.splitext(os.path.basename(args.checkpoint))[0]}_{args.split}_report.txt")
+    # One file per split, and per evaluation variant (another bus setting, the bikers' averaged
+    # top-1, picking set on the command line), so a val run never overwrites another report
+    variant = (("" if args.bus_as_car == trained_bus_as_car else ("_bus_as_car" if args.bus_as_car else "_bus_own"))
+               + ("_biker_mean" if args.biker_top1_mean else "")
+               + (f"_pick_{pick_override.get('goal_pick', 'set')}" if pick_override else ""))
+    save_path = os.path.join(save_dir, f"{os.path.splitext(os.path.basename(args.checkpoint))[0]}"
+                                       f"_{args.split}{variant}_report.txt")
     with open(save_path, "w") as f:
         f.write(report + "\n")
 

@@ -33,14 +33,21 @@ Map elements (hand-annotated with draw_shapes.py):
   (nobody may be inside it).
 - With --use_map_nodes True every sample's graph gets its video's shapes as
   "map" nodes, with map->agent and map->map edges (as in hdgt_map_gnn). Map
-  nodes are context only: nothing is predicted for them. Off by default.
+  nodes are context only: nothing is predicted for them.
 - A car, bus or cart whose every position in the video is inside the drawn
   obstacles is parked: that obstacle is how it is seen, and it is NOT an agent,
   so nothing is predicted for it either (see PARKED_TYPES).
 - The collate fn always hands the model each target agent's shapes in that
-  agent's own frame (geometry, class, forbidden for its type) and the image
-  border, for the goal predictor's map crop and reachability prior and for
-  test_sdd.py's MAP COMPLIANCE block (hdgt_goal_heatmap).
+  agent's own frame (geometry, class, forbidden for its type, and forbidden
+  minus the shapes its own GT path enters) and the image border, for the map
+  penalties, the goal distribution's map crop and reachability prior, the
+  ranker's map features and test_sdd.py's MAP COMPLIANCE block (hdgt_full).
+
+Reference images (sdd/images/<scene>/reference_video<N>.jpg):
+- Read only for the ranker's image clue (model.py --ranker_image): each
+  target's patch of its video's image, in its own frame, is cut when the
+  dataset is built (rank_image, crop_rank_patches) and batched as
+  "rank_image_lis".
 """
 
 import os
@@ -126,6 +133,11 @@ AGENT_TYPE_NAMES = {
     6: "Skater"
 }
 PEDESTRIAN_TYPE = 1
+# --bus_as_car: buses go through the car's weights everywhere the model has a set per
+# type. The train split has 32 buses (half of them standing) against 207 cars, too
+# few to train a bus's own weights. Their true type stays for the metrics and the map
+# rules (both wheeled), and their interaction range is the car's already (map_size_lis).
+BUS_TYPE, CAR_TYPE = 4, 3
 
 
 # =============================================================================
@@ -574,8 +586,46 @@ def load_scene_map(shapes_folder, scene_id, scale_factor=SCALE_FACTOR):
     }
 
 
+# =============================================================================
+# THE RANKER'S IMAGE PATCH (model.py --ranker_image)
+# Each target's patch of its video's reference image, sdd/images/<scene>/
+# reference_video<N>.jpg, in the target's own frame, cut once when the dataset
+# is built. model.RANK_PATCH_BEHIND reads the patches with the same share
+# (train.py checks it).
+# =============================================================================
+RANK_PATCH_BEHIND = 0.375   # share of the patch behind the agent
+
+
+def rank_image_settings(args):
+    """SDDDataset's rank_image for a model built with args: the patch its ranker
+    reads, {"size": cells per side, "px": image pixels per cell}, or None"""
+    if getattr(args, "ranker_image", False) not in (True, "True", "true", "1"):
+        return None
+    return {"size": int(getattr(args, "ranker_image_size", 64)),
+            "px": float(getattr(args, "ranker_image_px", 8.0))}
+
+
+def crop_rank_patches(image, pos, yaw, size, px):
+    """(3, H, W) float image -> (n, 3, size, size) uint8: the image around each
+    agent, in its frame. pos (n, 2) the agent's last observed position in image
+    pixels, yaw (n,) its heading. Rows run along the agent's y axis and columns
+    along x (its heading), one cell = px pixels, RANK_PATCH_BEHIND of the patch
+    behind the agent."""
+    _, h, w = image.shape
+    n, span = pos.shape[0], size * px
+    centres = (torch.arange(size, dtype=torch.float32) + 0.5) * px
+    gy, gx = torch.meshgrid(centres - span / 2, centres - span * RANK_PATCH_BEHIND, indexing="ij")
+    c, s = torch.cos(yaw)[:, None, None], torch.sin(yaw)[:, None, None]
+    wx = pos[:, 0, None, None] + gx * c - gy * s                         # image pixels
+    wy = pos[:, 1, None, None] + gy * c + gx * s
+    grid = torch.stack([wx / (w - 1) * 2 - 1, wy / (h - 1) * 2 - 1], dim=-1)
+    out = torch.nn.functional.grid_sample(image[None], grid.reshape(1, n * size, size, 2),
+                                          mode="bilinear", padding_mode="zeros", align_corners=True)
+    return out[0].reshape(3, n, size, size).permute(1, 0, 2, 3).round().clamp(0, 255).to(torch.uint8)
+
+
 class SDDDataset(Dataset):
-    def __init__(self, pickle_files, obs_len=8, pred_len=12, shapes_folder=None):
+    def __init__(self, pickle_files, obs_len=8, pred_len=12, shapes_folder=None, rank_image=None):
         """
         Args:
             pickle_files: List of pickle file paths
@@ -583,8 +633,13 @@ class SDDDataset(Dataset):
             pred_len: Number of prediction frames (default 12)
             shapes_folder: folder of per-video map pickles. Default: "shapes"
                 next to the folder holding each track pickle (../sdd/shapes).
+            rank_image: the ranker's image patch, {"size", "px"}
+                (rank_image_settings), cut for every target and kept in its
+                sample as "rank_image"; None (default) cuts none. Read from
+                "images" next to the folder holding each track pickle.
         """
         self.shapes_folder = shapes_folder
+        self.rank_image = rank_image
         self.scene_maps = {}
         self.parked_count = 0  # parked Car/Bus/Cart trajectories, not agents
         self.obs_len = obs_len
@@ -665,6 +720,9 @@ class SDDDataset(Dataset):
                 if sample is not None:
                     self.samples.append(sample)
 
+            if self.rank_image is not None:
+                self._cut_rank_images(pkl_file, scene_id, self.samples[n_before:])
+
             n_obst = int((scene_map["cls"] == MAP_OBSTACLE).sum())
             n_grass = int((scene_map["cls"] == MAP_GRASS).sum())
             print(f"  [{pkl_idx+1:2d}/{len(pickle_files)}] {scene_id:28s} -> {len(self.samples):6d} total samples"
@@ -698,6 +756,30 @@ class SDDDataset(Dataset):
         print(f"{'-'*60}")
         print(f"{'TOTAL':<15} {total_agents:>10,} {100.0:>11.2f}%")
         print(f"{'-'*60}")
+
+    def _cut_rank_images(self, pkl_file, scene_id, samples):
+        """Each target's patch of its video's reference image (crop_rank_patches),
+        at its last observed position and heading, kept in its sample as
+        "rank_image" (pred_num, 3, size, size) uint8"""
+        from PIL import Image
+        scene, number = scene_id.rsplit("_video", 1)
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(pkl_file))),
+                            "images", scene, f"reference_video{number}.jpg")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"the ranker reads each video's reference image, and {path} "
+                                    f"is missing (sdd/images/<scene>/reference_video<N>.jpg)")
+        if not samples:
+            return
+        image = torch.from_numpy(np.asarray(Image.open(path).convert("RGB")).copy()).permute(2, 0, 1).float()
+        last = np.concatenate([s["agent_feature"][:s["pred_num"], -1] for s in samples])   # (n, 7)
+        pos = torch.as_tensor(last[:, :2] * self.scale_factor, dtype=torch.float32)        # pixels
+        yaw = torch.as_tensor(last[:, 4], dtype=torch.float32)
+        patches = torch.cat([crop_rank_patches(image, p, y, self.rank_image["size"], self.rank_image["px"])
+                             for p, y in zip(pos.split(512), yaw.split(512))]).numpy()
+        start = 0
+        for s in samples:
+            s["rank_image"] = patches[start:start + s["pred_num"]]
+            start += s["pred_num"]
 
     def _tracks_of_scene(self, df):
         """Per agent (trackId): its frames, positions and box sizes sorted by frame (SCALED), and its type"""
@@ -981,7 +1063,8 @@ def obtain_dataset(gpu, gpu_count, seed_num, args, test_only=False):
         print(f"\n{'#'*80}")
         print(f"# LOADING TRAINING SET")
         print(f"{'#'*80}")
-        train_dataset = SDDDataset(train_files, obs_len=args.obs_len, pred_len=args.pred_len)
+        train_dataset = SDDDataset(train_files, obs_len=args.obs_len, pred_len=args.pred_len,
+                                   rank_image=rank_image_settings(args))
         
         # Balanced batches as in the original HDGT, the same batches in every version (see
         # BalancedBatchSampler). With several GPUs each one takes its own slice of the batches;
@@ -1006,7 +1089,8 @@ def obtain_dataset(gpu, gpu_count, seed_num, args, test_only=False):
     print(f"\n{'#'*80}")
     print(f"# LOADING {eval_split.upper()} SET")
     print(f"{'#'*80}")
-    eval_dataset = SDDDataset(eval_files, obs_len=args.obs_len, pred_len=args.pred_len)
+    eval_dataset = SDDDataset(eval_files, obs_len=args.obs_len, pred_len=args.pred_len,
+                              rank_image=rank_image_settings(args))
 
     eval_dataloader = None
     if gpu == 0 or test_only:
@@ -1254,6 +1338,7 @@ def SDD_collate_fn(batch, args, is_train):
     # way (it is cheap), so the map penalties and metrics work without them too.
     use_map = getattr(args, 'use_map_nodes', False) in (True, 'True', 'true', '1')
     map_margin = 0.0   # a point outside every shape is never penalised
+    bus_as_car = getattr(args, 'bus_as_car', False) in (True, "True", "true", "1")
 
     scene_map_lis = [item["scene_map"] for item in batch]
     agent_feature_lis = [item["agent_feature"] for item in batch]
@@ -1265,6 +1350,8 @@ def SDD_collate_fn(batch, args, is_train):
     label_mask_lis = [item["label_mask"] for item in batch]
     case_id_lis = [item["scene_id"] for item in batch]
     object_id_lis = [item["object_id_lis"] for item in batch]
+    # The ranker's image patch of every target, when the dataset cut them (rank_image)
+    rank_image_lis = [item["rank_image"] for item in batch] if "rank_image" in batch[0] else None
 
     # Agent dropout for regularization during training
     if agent_drop > 0 and is_train:
@@ -1283,6 +1370,8 @@ def SDD_collate_fn(batch, args, is_train):
             label_vel_lis[i] = label_vel_lis[i][target_keep_index]
             goal_pos_lis[i] = goal_pos_lis[i][target_keep_index]
             label_mask_lis[i] = label_mask_lis[i][target_keep_index]
+            if rank_image_lis is not None:
+                rank_image_lis[i] = rank_image_lis[i][target_keep_index]
 
     neighbor_size = np.array([int(agent_feature_lis[i].shape[0]) for i in range(len(agent_feature_lis))])
 
@@ -1297,6 +1386,7 @@ def SDD_collate_fn(batch, args, is_train):
     out_map_loss_lis = []
     out_map_cls_lis = []
     out_map_img_lis = []
+    out_true_type_lis = []
 
     for i in range(len(agent_feature_lis)):
         # Compute agent map size (values are already in SCALED coordinates)
@@ -1325,6 +1415,9 @@ def SDD_collate_fn(batch, args, is_train):
 
         now_agent_feature = agent_feature_lis[i]
         now_agent_type = agent_type_lis[i]
+        # The type that picks the model's per-type weights (--bus_as_car); now_agent_type stays true
+        param_type = (np.where(now_agent_type == BUS_TYPE, CAR_TYPE, now_agent_type) if bus_as_car
+                      else now_agent_type)
 
         if use_map:
             # Map nodes: own-frame size and shape kind; the class is the node type.
@@ -1355,7 +1448,7 @@ def SDD_collate_fn(batch, args, is_train):
             now_t0_e_feature[:, -1, 4], now_t0_v_feature[:, -1, 4]
         )
         g.edges["self"].data['a_e_fea'] = torch.as_tensor(now_t0_e_feature.astype(np.float32))
-        g.edges["self"].data['a_e_type'] = torch.as_tensor((now_agent_type[type0_u].ravel() - 1).astype(np.int32)).long()
+        g.edges["self"].data['a_e_type'] = torch.as_tensor((param_type[type0_u].ravel() - 1).astype(np.int32)).long()
 
         # Agent-to-agent edges
         type1_u, type1_v = g.edges(etype="other")
@@ -1371,7 +1464,7 @@ def SDD_collate_fn(batch, args, is_train):
                 now_t1_e_feature[:, -1, 4], now_t1_v_feature[:, -1, 4]
             )
             g.edges["other"].data['a_e_fea'] = torch.as_tensor(now_t1_e_feature.astype(np.float32))
-            g.edges["other"].data['a_e_type'] = torch.as_tensor((now_agent_type[type1_u].ravel() - 1).astype(np.int32)).long()
+            g.edges["other"].data['a_e_type'] = torch.as_tensor((param_type[type1_u].ravel() - 1).astype(np.int32)).long()
         else:
             g.edges["other"].data['a_e_fea'] = torch.zeros((0, 4))
             g.edges["other"].data['a_e_type'] = torch.zeros((0,)).long()
@@ -1433,13 +1526,14 @@ def SDD_collate_fn(batch, args, is_train):
 
         # Assign to graph
         g.nodes["agent"].data["a_n_fea"] = torch.as_tensor(now_all_agent_n_feature.astype(np.float32))
-        g.nodes["agent"].data["a_n_type"] = torch.as_tensor((now_agent_type - 1).astype(np.int32)).long()
+        g.nodes["agent"].data["a_n_type"] = torch.as_tensor((param_type - 1).astype(np.int32)).long()
 
         out_graph_lis.append(g)
         out_label_pos_lis.append(now_label_pos)
         out_label_vel_lis.append(now_label_vel)
         out_goal_pos_lis.append(now_goal_pos)
         out_label_mask_lis.append(label_mask_lis[i][selected_pred_indices])
+        out_true_type_lis.append(now_agent_type[selected_pred_indices] - 1)
 
         # Map penalty geometry for the targets, in each target's own frame.
         # label_pos_lis[i] is still the untouched WORLD GT (only copies were
@@ -1492,6 +1586,16 @@ def SDD_collate_fn(batch, args, is_train):
     output_dic["goal_pos_lis"] = torch.as_tensor(np.concatenate(out_goal_pos_lis, axis=0).astype(np.float32))
 
     output_dic["label_mask_lis"] = torch.as_tensor(np.concatenate(out_label_mask_lis, axis=0).astype(np.float32))
+
+    # (N,) each target's TRUE type, 0-based, for the metrics: the graph's types are the ones
+    # that pick the model's weights, which with --bus_as_car call a bus a car
+    output_dic["target_type_lis"] = torch.as_tensor(np.concatenate(out_true_type_lis, axis=0).astype(np.int64))
+    output_dic["cuda_tensor_lis"].append("target_type_lis")
+
+    if rank_image_lis is not None:
+        # (N, 3, size, size) uint8, in target order like the labels
+        output_dic["rank_image_lis"] = torch.as_tensor(np.concatenate(rank_image_lis, axis=0))
+        output_dic["cuda_tensor_lis"].append("rank_image_lis")
 
     # Batch graphs
     output_g = dgl.batch(out_graph_lis)

@@ -33,6 +33,7 @@ from matplotlib.lines import Line2D
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["DGLBACKEND"] = "pytorch"
 
+from sdd_dataset import rank_image_settings
 from sdd_dataset import (SDDDataset, SDD_collate_fn, SCALE_FACTOR,
                          resolve_split_files)
 
@@ -88,9 +89,7 @@ def main():
     parser.add_argument("--use_refiner", type=str, default="True")
     parser.add_argument("--goal_loss_weight", type=float, default=0.5)
     parser.add_argument("--goal_curriculum_epochs", type=int, default=10)
-    # Scorer: read from the checkpoint's weights by default, so the model is rebuilt as trained
-    parser.add_argument("--use_scorer", type=str, default=None)
-    parser.add_argument("--scorer_type", type=str, default=None, choices=["mode", "traj"])
+    # Everything about the model (components, ranker, bus setting) is read from the checkpoint
     args = parser.parse_args()
     args.use_refiner = (args.use_refiner == "True")
 
@@ -104,20 +103,15 @@ def main():
     # Model
     # ------------------------------------------------------------------
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    # The scorer the checkpoint was trained with, read from its weights (traj_scorer.* =
-    # TrajScorer, mode_scorer.* = ModeScorer, neither = no scorer) unless given on the command line
-    scorer_in_weights = next((kind for kind, prefix in (("traj", "traj_scorer."), ("mode", "mode_scorer."))
-                              if any(k.startswith(prefix) for k in checkpoint["model_state_dict"])), None)
-    if args.use_scorer is None:
-        args.use_scorer = "True" if scorer_in_weights else "False"
-    if args.scorer_type is None:
-        args.scorer_type = scorer_in_weights or "mode"
     model_module = importlib.import_module("model")
-    # Rebuilt as trained (goal predictor and its settings, map nodes, class statistics), as in
-    # test_sdd.py; the loader adds the map nodes when the checkpoint has them
-    from test_sdd import build_model, map_nodes_of
-    model, _ = build_model(model_module, checkpoint, args, device, args.use_scorer, args.scorer_type)
-    args.use_map_nodes = map_nodes_of(checkpoint)
+    # Rebuilt as trained (components, goal and ranker settings, class statistics), as in
+    # test_sdd.py; the loader follows the checkpoint: map nodes, image patches, bus setting
+    from test_sdd import build_model
+    model, comp = build_model(model_module, checkpoint, args, device)
+    args.use_map_nodes = comp["use_map_nodes"]
+    args.ranker_image = comp["use_ranker"] and comp["ranker_image"]
+    args.ranker_image_size, args.ranker_image_px = comp["ranker_image_size"], comp["ranker_image_px"]
+    args.bus_as_car = comp["bus_as_car"]
     print(f"Loaded {args.checkpoint} (epoch {checkpoint.get('epoch', '?')}, "
           f"val minFDE {checkpoint.get('val_loss', float('nan')):.4f} px)")
 
@@ -126,7 +120,8 @@ def main():
     # ------------------------------------------------------------------
     test_files = resolve_split_files(args.data_folder, args.split)
     print(f"Visualizing the {args.split.upper()} split ({len(test_files)} videos)")
-    dataset = SDDDataset(test_files, obs_len=args.obs_len, pred_len=args.pred_len)
+    dataset = SDDDataset(test_files, obs_len=args.obs_len, pred_len=args.pred_len,
+                         rank_image=rank_image_settings(args))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         pin_memory=(device.type == "cuda"),
                         collate_fn=partial(SDD_collate_fn, args=args, is_train=False),
